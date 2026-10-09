@@ -266,6 +266,18 @@ pub struct E2eSession {
     seals: u64,
     opens: u64,
     rejects: u64,
+    /// Last Hello frame we sent, verbatim — retransmitted by the
+    /// initiator's retry loop until the session establishes (the
+    /// SFU can drop a frame published before the peer subscribes).
+    hello_out: Vec<u8>,
+    /// Last Resp frame we sent — resent when a duplicate Hello
+    /// arrives while we wait for Finish (the initiator's retry
+    /// loop depends on this to recover a lost Resp).
+    resp_out: Vec<u8>,
+    /// Last Finish frame we sent — retransmitted after establishing
+    /// until a sealed frame from the responder opens, proving the
+    /// responder also reached Established.
+    finish_out: Vec<u8>,
 }
 
 impl E2eSession {
@@ -288,6 +300,9 @@ impl E2eSession {
             seals: 0,
             opens: 0,
             rejects: 0,
+            hello_out: Vec::new(),
+            resp_out: Vec::new(),
+            finish_out: Vec::new(),
         }
     }
 
@@ -297,6 +312,29 @@ impl E2eSession {
 
     pub fn failed(&self) -> bool {
         self.state == State::Failed
+    }
+
+    /// Initiator-side retry support: the exact Hello frame to
+    /// resend while the session hasn't established. Regenerating it
+    /// would change the transcript hash and break the responder's
+    /// check, so the original bytes are replayed.
+    pub fn retransmit_hello(&self) -> Option<Vec<u8>> {
+        if self.state == State::SentHello && !self.hello_out.is_empty() {
+            Some(self.hello_out.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Initiator-side retry support: the exact Finish frame to
+    /// resend after establishing, until the responder's own sealed
+    /// frames prove it also reached Established.
+    pub fn retransmit_finish(&self) -> Option<Vec<u8>> {
+        if self.state == State::Established && !self.finish_out.is_empty() {
+            Some(self.finish_out.clone())
+        } else {
+            None
+        }
     }
 
     /// 6-hex-char SAS once the handshake completes.
@@ -389,6 +427,7 @@ impl E2eSession {
         // match.
         self.t1 = digest(&SHA256, &frame).as_ref().to_vec();
         self.transcript_init = frame.clone();
+        self.hello_out = frame.clone();
         self.state = State::SentHello;
         Ok(frame)
     }
@@ -418,8 +457,18 @@ impl E2eSession {
             return Err(E2eError::Protocol);
         }
         match self.state {
-            // Duplicate / late Hello — nothing to say.
-            State::Established | State::SentResponse => return Ok(None),
+            // Established: the handshake is over; a late Hello is noise.
+            State::Established => return Ok(None),
+            // Duplicate Hello while we wait for Finish: our Resp (or
+            // its carrier frame) got lost — resend it verbatim. The
+            // initiator's retry loop relies on this to recover.
+            State::SentResponse => {
+                return Ok(if self.resp_out.is_empty() {
+                    None
+                } else {
+                    Some(self.resp_out.clone())
+                });
+            }
             State::Failed => return Err(E2eError::Protocol),
             State::Idle => {}
             State::SentHello => {
@@ -445,6 +494,7 @@ impl E2eSession {
         resp.extend_from_slice(&pub_bytes);
         resp.extend_from_slice(&auth_tok);
         self.transcript_resp = resp.clone();
+        self.resp_out = resp.clone();
         self.keys = Some(keys);
         self.state = State::SentResponse;
         Ok(Some(resp))
@@ -487,6 +537,7 @@ impl E2eSession {
         let mut fin = Vec::with_capacity(3 + AUTH_BODY_LEN);
         fin.extend_from_slice(&[FRAME_TYPE_KEY, E2E_VERSION, MSG_FINISH]);
         fin.extend_from_slice(&auth_tok);
+        self.finish_out = fin.clone();
         self.sas = Some(sas(&self.t1, t2.as_ref()));
         self.keys = Some(keys);
         self.state = State::Established;

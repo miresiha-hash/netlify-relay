@@ -145,11 +145,12 @@ pub struct Resolved {
 
 impl Resolved {
     pub fn merge_cli(
-        cfg:        &Config,
-        cli_mode:   Option<String>,
-        cli_nat:    Option<String>,
-        cli_port:   u16,
-        client_tun: bool,
+        cfg:             &Config,
+        cli_mode:        Option<String>,
+        cli_nat:         Option<String>,
+        cli_port:        u16,
+        client_tun:      bool,
+        cli_config_dir:  Option<PathBuf>,
     ) -> Self {
         // CLI > config file > unset (UI picker).
         let mode_pinned_by_cli = cli_mode.is_some();
@@ -159,7 +160,13 @@ impl Resolved {
         let nat_mode = cli_nat
             .or_else(|| cfg.nat_mode.clone())
             .unwrap_or_else(|| "userspace".to_string());
-        let config_dir = config_dir(None).unwrap_or_else(|_| PathBuf::from("."));
+        // `--config-dir` must drive BOTH the initial load and the
+        // long-lived ConfigFile handle — otherwise a daemon started
+        // with the flag loads its config from one directory and
+        // persists (token included) into another, and every restart
+        // silently reverts the peer selection.
+        let config_dir = config_dir(cli_config_dir.as_deref())
+            .unwrap_or_else(|_| PathBuf::from("."));
         Self {
             mode,
             nat_mode,
@@ -193,6 +200,43 @@ fn config_dir(override_dir: Option<&Path>) -> std::io::Result<PathBuf> {
     // Fallback: cwd. Only hit if `current_exe()` fails (rare —
     // sandboxed environments where /proc/self/exe is inaccessible).
     std::env::current_dir()
+}
+
+/// One-time migration for `--config-dir` deployments: before the
+/// split-brain fix, the config STRUCT loaded from the flag dir while
+/// the [`ConfigFile`] handle persisted (token included) into the
+/// default `<exe-dir>` location. Move that file into the flag dir so
+/// logins survive the upgrade. Idempotent — a present target file
+/// wins.
+pub fn migrate_config_dir(target: &Path) {
+    let dst = match config_path(Some(target)) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if dst.exists() {
+        return;
+    }
+    let default = match config_dir(None) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    if default == target {
+        return;
+    }
+    let src = match config_path(Some(&default)) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if !src.exists() {
+        return;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => log::info!("config: migrated {src:?} -> {dst:?}"),
+        Err(e) => log::warn!("config: migration {src:?} -> {dst:?} failed: {e}"),
+    }
 }
 
 // ─── Shared config file handle ──────────────────────────────

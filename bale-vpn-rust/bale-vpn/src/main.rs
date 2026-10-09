@@ -136,6 +136,7 @@ fn main() {
         cli_nat,
         cli.port,
         client_tun,
+        cli.config_dir.clone(),
     );
 
     // GUI vs headless dispatch:
