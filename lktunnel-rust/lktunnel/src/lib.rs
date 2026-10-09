@@ -27,6 +27,10 @@ pub mod ipv6;
 pub mod nat;
 pub mod rtc;
 pub mod rtp;
+/// End-to-end encryption for payload frames. The SFU is an untrusted
+/// relay — everything on the carrier is sealed here with a key the
+/// relay never learns.
+pub mod e2e;
 pub(crate) mod quic_tunnel;
 pub mod server;
 pub mod socks5_quic;
@@ -290,6 +294,10 @@ pub struct LkTunnel {
     /// QUIC client) and guards `start_server` / `attach_tun` from
     /// being called against the wrong role.
     role: TunnelRole,
+    /// End-to-end encryption session with the peer. Sealed on the
+    /// send path, opened on receive — the SFU only ever relays
+    /// opaque `'E'` frames and never sees a key.
+    e2e:        Mutex<e2e::E2eSession>,
 }
 
 /// Tunnel role, decided at construction time.
@@ -339,6 +347,24 @@ pub fn connect_loopback() -> (Arc<LkTunnel>, Arc<LkTunnel>) {
     b_inner.connected.store(true, Ordering::Relaxed);
     let _ = a_inner.state_tx.send(TunnelState::Connected);
     let _ = b_inner.state_tx.send(TunnelState::Connected);
+    // Kick off the E2E handshake over the same channel every other
+    // frame uses — the wire path (send → forwarder → dispatch →
+    // reply) is exercised, not a shortcut. Tests assume the session
+    // is ready to seal by the time this returns, so wait (bounded)
+    // for both sides to establish.
+    a_inner.start_e2e_handshake();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !(a_inner.e2e_established() && b_inner.e2e_established()) {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "loopback e2e handshake did not complete within 10s \
+                 (a_established={} b_established={} a_stats={:?} b_stats={:?})",
+                a_inner.e2e_established(), b_inner.e2e_established(),
+                a_inner.e2e_stats(), b_inner.e2e_stats(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     (a_inner, b_inner)
 }
 
@@ -372,6 +398,10 @@ fn build_loopback_inner(role: TunnelRole) -> (Arc<LkTunnel>, tokio::sync::mpsc::
         socks5_handle: Mutex::new(None),
         quic_server_handle: Mutex::new(None),
         role,
+        e2e: Mutex::new(e2e::E2eSession::new(match role {
+            TunnelRole::Client => e2e::Role::Initiator,
+            TunnelRole::Server => e2e::Role::Responder,
+        }, None)),
     });
     (inner, send_rx)
 }
@@ -385,52 +415,61 @@ fn spawn_loopback_forwarder(
     mut from_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     to_inner:    Arc<LkTunnel>,
 ) {
+    // Two consumers, mirroring what `LkTunnel::connect` binds on the
+    // real path: `'I'` → the inbound drain queue, `'Q'` → the QUIC
+    // channel. Handing them to `dispatch_payload` means the loopback
+    // exercises the *same* receive-side code as the SFU path —
+    // including the E2E unwrap and the downgrade protection.
+    let on_ip: Arc<dyn Fn(&[u8]) + Send + Sync> = {
+        let to_inner = Arc::clone(&to_inner);
+        Arc::new(move |ip: &[u8]| {
+            if ip.is_empty() { return; }
+            let payload = ip.to_vec();
+            let needs_drain = {
+                let mut q = to_inner.inbound.lock();
+                let was_empty = q.is_empty();
+                if q.len() >= INBOUND_QUEUE_CAP {
+                    q.pop_front();
+                    let n = to_inner.inbound_drops
+                        .fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        log::warn!("loopback: inbound overflow — \
+                                    {n} packets dropped on tunnel {}",
+                                   to_inner.id);
+                    }
+                }
+                q.push_back(payload);
+                was_empty
+            };
+            if needs_drain {
+                let weak = Arc::downgrade(&to_inner);
+                dispatcher::post(Box::new(move || {
+                    let Some(inner) = weak.upgrade() else { return };
+                    loop {
+                        let pkt = inner.inbound.lock().pop_front();
+                        match pkt {
+                            Some(b) => inner.inject_inbound_ip(&b),
+                            None    => break,
+                        }
+                    }
+                }));
+            }
+        })
+    };
+    let on_quic: Arc<dyn Fn(bytes::Bytes) + Send + Sync> = {
+        let to_inner = Arc::clone(&to_inner);
+        Arc::new(move |bytes: bytes::Bytes| {
+            to_inner.counters.bump_rx(bytes.len());
+            let tx = to_inner.quic_rx_tx.lock().clone();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(bytes);
+            }
+        })
+    };
     runtime().spawn(async move {
         while let Some(frame) = from_rx.recv().await {
             if frame.is_empty() { continue; }
-            match frame[0] {
-                FRAME_TYPE_IP => {
-                    let payload = frame[1..].to_vec();
-                    let needs_drain = {
-                        let mut q = to_inner.inbound.lock();
-                        let was_empty = q.is_empty();
-                        if q.len() >= INBOUND_QUEUE_CAP {
-                            q.pop_front();
-                            let n = to_inner.inbound_drops
-                                .fetch_add(1, Ordering::Relaxed) + 1;
-                            if n.is_power_of_two() {
-                                log::warn!("loopback: inbound overflow — \
-                                            {n} packets dropped on tunnel {}",
-                                           to_inner.id);
-                            }
-                        }
-                        q.push_back(payload);
-                        was_empty
-                    };
-                    if needs_drain {
-                        let weak = Arc::downgrade(&to_inner);
-                        dispatcher::post(Box::new(move || {
-                            let Some(inner) = weak.upgrade() else { return };
-                            loop {
-                                let pkt = inner.inbound.lock().pop_front();
-                                match pkt {
-                                    Some(b) => inner.inject_inbound_ip(&b),
-                                    None    => break,
-                                }
-                            }
-                        }));
-                    }
-                }
-                FRAME_TYPE_QUIC => {
-                    let payload = &frame[1..];
-                    to_inner.counters.bump_rx(payload.len());
-                    let tx = to_inner.quic_rx_tx.lock().clone();
-                    if let Some(tx) = tx {
-                        let _ = tx.try_send(bytes::Bytes::copy_from_slice(payload));
-                    }
-                }
-                _ => {}  // unknown frame type, drop silently
-            }
+            to_inner.dispatch_payload(bytes::Bytes::from(frame), &on_ip, &on_quic);
         }
     });
 }
@@ -535,6 +574,10 @@ impl LkTunnel {
             socks5_handle: Mutex::new(None),
             quic_server_handle: Mutex::new(None),
             role,
+            e2e: Mutex::new(e2e::E2eSession::new(match role {
+                TunnelRole::Client => e2e::Role::Initiator,
+                TunnelRole::Server => e2e::Role::Responder,
+            }, None)),
         });
 
         // Inbound IP routing — same bounded per-tunnel queue pattern.
@@ -651,6 +694,23 @@ impl LkTunnel {
         if !self.connected.load(Ordering::Relaxed) {
             return Err(SendError::NotConnected);
         }
+        // Seal everything except handshake frames (`'K'` carries
+        // public keys only — no secret ever travels in the clear).
+        // Fail-closed: until the handshake completes, no data frame
+        // leaves the device.
+        let buf = if buf[0] == e2e::FRAME_TYPE_KEY {
+            buf
+        } else {
+            let mut guard = self.e2e.lock();
+            match guard.seal(&buf) {
+                Ok(sealed) => sealed,
+                Err(err) => {
+                    drop(guard);
+                    log::debug!("LkTunnel[{}]: e2e seal failed (len={}): {err}", self.id, buf.len());
+                    return Err(SendError::NotConnected);
+                }
+            }
+        };
         use tokio::sync::mpsc::error::TrySendError;
         match self.tx.try_send(buf) {
             Ok(()) => {
@@ -1332,7 +1392,11 @@ async fn run_connect_task(
     });
     let on_packet: Arc<dyn Fn(bytes::Bytes) + Send + Sync> = {
         let on_ip = Arc::clone(&on_ip);
-        Arc::new(move |payload: bytes::Bytes| dispatch_payload(payload, &on_ip, &on_quic))
+        let weak = std::sync::Weak::clone(&weak);
+        Arc::new(move |payload: bytes::Bytes| {
+            let Some(inner) = weak.upgrade() else { return };
+            inner.dispatch_payload(payload, &on_ip, &on_quic);
+        })
     };
 
     // Phase 1: join the SFU, bring up both PeerConnections, publish the
@@ -1573,6 +1637,11 @@ async fn run_tunnel_loop(
     if let Some(tunnel) = weak.upgrade() {
         match tunnel.role {
             TunnelRole::Client => {
+                // The peer is present → the E2E handshake can start.
+                // Client role = initiator (the server side just waits
+                // for the `'K'` frame); send_ip stays fail-closed
+                // until this completes.
+                tunnel.start_e2e_handshake();
                 runtime().spawn(async move {
                     if let Err(e) = tunnel.ensure_quic_client().await {
                         log::warn!("auto ensure_quic_client failed: {e} — \
@@ -1644,32 +1713,173 @@ fn emit_event(
 /// Parse one wire payload and route to the matching consumer.
 /// `'I'`-tagged frames go to `on_ip` (raw IP packets for NAT / TUN);
 /// `'Q'`-tagged frames go to `on_quic` (quinn datagrams for the QUIC
-/// reliable channel that backs SOCKS5-over-tunnel). Unknown tags are
-/// dropped with a debug log — the tag byte reserves namespace for
-/// additional planes without a breaking wire change.
+/// reliable channel that backs SOCKS5-over-tunnel).
+///
+/// `'E'`-tagged frames are sealed by [`e2e`] and unwrapped here
+/// (one nesting level only — a sealed frame must open onto a data
+/// frame, never onto another control frame). `'K'` frames are
+/// handshake messages. Plaintext `'I'` / `'Q'` frames arriving on
+/// the wire are a **downgrade attempt** (or a peer that predates the
+/// E2E layer): they're dropped and counted as a security event.
 /// Bytes arrive here from the RTP transformer's on_data observer
 /// (see [`rtp`]).
-fn dispatch_payload(
-    payload: bytes::Bytes,
-    on_ip:   &Arc<dyn Fn(&[u8]) + Send + Sync>,
-    on_quic: &Arc<dyn Fn(bytes::Bytes) + Send + Sync>,
-) {
-    static DISPATCHED: AtomicU64 = AtomicU64::new(0);
-    static IP_COUNT:   AtomicU64 = AtomicU64::new(0);
-    static QUIC_COUNT: AtomicU64 = AtomicU64::new(0);
-    let n = DISPATCHED.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_power_of_two() {
-        log::debug!("rtp dispatch checkpoint: {n} payloads (last len={}) ip={} quic={}",
-            payload.len(),
-            IP_COUNT.load(Ordering::Relaxed),
-            QUIC_COUNT.load(Ordering::Relaxed));
+impl LkTunnel {
+    /// Whether the E2E handshake with the peer has completed. Until
+    /// this is true, [`Self::send_ip`] fails closed.
+    pub fn e2e_established(&self) -> bool {
+        self.e2e.lock().established()
     }
-    match payload.first() {
-        Some(&FRAME_TYPE_IP)   => { IP_COUNT.fetch_add(1, Ordering::Relaxed); on_ip(&payload[1..]) }
-        Some(&FRAME_TYPE_QUIC) => { QUIC_COUNT.fetch_add(1, Ordering::Relaxed); on_quic(payload.slice(1..)) }
-        Some(&other)           => log::debug!(
-            "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
-        None                   => {}
+
+    /// Short authentication string (6 hex chars, identical on both
+    /// peers). Comparing it out-of-band proves nobody is in the
+    /// middle — the SFU can't fake it without the DH secret.
+    pub fn e2e_sas(&self) -> Option<String> {
+        self.e2e.lock().sas()
+    }
+
+    /// Send/receive counters for the E2E layer: `(sealed, opened,
+    /// rejected)`. Surfaced in logs for debugging handshake trouble.
+    pub fn e2e_stats(&self) -> (u64, u64, u64) {
+        self.e2e.lock().stats()
+    }
+
+    /// Kick off the handshake (initiator side only). Called once the
+    /// peer is present — the responder side just waits for `'K'`.
+    fn start_e2e_handshake(&self) {
+        let hello = {
+            let mut guard = self.e2e.lock();
+            if guard.established() || guard.failed() {
+                return;
+            }
+            match guard.start() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    log::warn!("LkTunnel[{}]: e2e start failed: {e}", self.id);
+                    return;
+                }
+            }
+        };
+        if let Err(e) = self.send_raw_frame(hello, 0) {
+            log::warn!("LkTunnel[{}]: e2e hello send failed: {e}", self.id);
+        }
+    }
+
+    /// Handle an inbound handshake frame. The reply (if any) goes
+    /// back out through the normal send path, so it rides the same
+    /// carrier as data frames.
+    fn on_handshake_frame(&self, payload: &bytes::Bytes) {
+        let reply = {
+            let mut guard = self.e2e.lock();
+            match guard.on_handshake(payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(guard);
+                    self.security_event(format!("handshake rejected: {e} (len={})", payload.len()));
+                    return;
+                }
+            }
+        };
+        if let Some(frame) = reply {
+            if let Err(e) = self.send_raw_frame(frame, 0) {
+                log::warn!("LkTunnel[{}]: e2e handshake reply send failed: {e}", self.id);
+            }
+        }
+        if self.e2e.lock().established() {
+            let (seals, opens, rejects) = self.e2e_stats();
+            log::info!("LkTunnel[{}]: e2e established — SAS {:?} \
+                        (seals={seals} opens={opens} rejects={rejects})",
+                       self.id, self.e2e_sas().unwrap_or_default());
+        }
+    }
+
+    /// Rate-limited security-event log (power-of-two cadence) so an
+    /// attacker sending garbage can't flood the log.
+    fn security_event(&self, detail: String) {
+        static EVENTS: AtomicU64 = AtomicU64::new(0);
+        let n = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            log::warn!("LkTunnel[{}]: e2e security event x{n}: {detail}", self.id);
+        }
+    }
+
+    /// Route an already-plaintext data frame to its consumer.
+    fn route_plain(
+        &self,
+        payload: &bytes::Bytes,
+        on_ip:   &Arc<dyn Fn(&[u8]) + Send + Sync>,
+        on_quic: &Arc<dyn Fn(bytes::Bytes) + Send + Sync>,
+    ) {
+        match payload.first() {
+            Some(&FRAME_TYPE_IP)   => on_ip(&payload[1..]),
+            Some(&FRAME_TYPE_QUIC) => on_quic(payload.slice(1..)),
+            Some(&other)           => log::debug!(
+                "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
+            None                   => {}
+        }
+    }
+
+    /// See the module-level doc above: `'E'` unwraps, `'K'`
+    /// drives the handshake, bare `'I'`/`'Q'` are dropped as
+    /// downgrade attempts.
+    fn dispatch_payload(
+        &self,
+        payload: bytes::Bytes,
+        on_ip:   &Arc<dyn Fn(&[u8]) + Send + Sync>,
+        on_quic: &Arc<dyn Fn(bytes::Bytes) + Send + Sync>,
+    ) {
+        static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+        static E2E_COUNT:  AtomicU64 = AtomicU64::new(0);
+        static IP_COUNT:   AtomicU64 = AtomicU64::new(0);
+        static QUIC_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = DISPATCHED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            log::debug!("rtp dispatch checkpoint: {n} payloads (last len={}) e2e={} ip={} quic={}",
+                payload.len(),
+                E2E_COUNT.load(Ordering::Relaxed),
+                IP_COUNT.load(Ordering::Relaxed),
+                QUIC_COUNT.load(Ordering::Relaxed));
+        }
+        match payload.first() {
+            Some(&e2e::FRAME_TYPE_E2E) => {
+                E2E_COUNT.fetch_add(1, Ordering::Relaxed);
+                let opened = {
+                    let mut guard = self.e2e.lock();
+                    guard.open(&payload)
+                };
+                match opened {
+                    Ok(inner) => {
+                        let inner = bytes::Bytes::from(inner);
+                        // One nesting level only: an unwrapped frame must
+                        // be a data frame. Anything else means a control
+                        // frame was smuggled inside our AEAD — drop it.
+                        match inner.first() {
+                            Some(&FRAME_TYPE_IP) => {
+                                IP_COUNT.fetch_add(1, Ordering::Relaxed);
+                                self.route_plain(&inner, on_ip, on_quic);
+                            }
+                            Some(&FRAME_TYPE_QUIC) => {
+                                QUIC_COUNT.fetch_add(1, Ordering::Relaxed);
+                                self.route_plain(&inner, on_ip, on_quic);
+                            }
+                            _ => self.security_event(format!(
+                                "sealed frame opened onto a non-data frame (len={})",
+                                inner.len())),
+                        }
+                    }
+                    Err(e) => self.security_event(format!(
+                        "sealed frame rejected: {e} (len={})", payload.len())),
+                }
+            }
+            Some(&e2e::FRAME_TYPE_KEY) => self.on_handshake_frame(&payload),
+            Some(&FRAME_TYPE_IP) | Some(&FRAME_TYPE_QUIC) => {
+                self.security_event(format!(
+                    "plaintext data frame on the wire (tag 0x{:02x}, len={}) — dropped",
+                    payload[0], payload.len()));
+            }
+            Some(&other) => log::debug!(
+                "unknown frame type 0x{other:02x} (len={}) — dropping", payload.len()),
+            None                   => {}
+        }
     }
 }
 

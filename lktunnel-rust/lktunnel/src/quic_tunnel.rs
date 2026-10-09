@@ -53,7 +53,7 @@
 //! ```ignore
 //! let mut tc = quinn::TransportConfig::default();
 //! tc.initial_mtu(1100);                    // leave room for packing
-//! tc.max_udp_payload_size(1200)?;          // hard cap
+//! tc.max_udp_payload_size(1150)?;          // hard cap (room for E2E tag)
 //! tc.mtu_discovery_config(None);           // virtual path, no PMTUD
 //! ```
 //!
@@ -206,7 +206,7 @@ impl quinn::AsyncUdpSocket for TunnelUdpSocket {
                     let dst = &mut bufs[filled];
                     if bytes.len() > dst.len() {
                         // quinn's recv buffers are sized to `EndpointConfig
-                        // .max_udp_payload_size` (we set 1200). A bigger
+                        // .max_udp_payload_size` (we set 1150). A bigger
                         // datagram means an upstream sender or a stray
                         // 'Q'-tagged frame from elsewhere exceeded our
                         // negotiated MTU. Drop the datagram with a
@@ -298,9 +298,10 @@ impl quinn::UdpPoller for DrainPoller {
 
 // ── Transport / crypto config ─────────────────────────────────────────
 
-/// Tuned for the Opus-frame substrate: cap at 1200-byte UDP payloads
-/// so each datagram fits in an Opus frame alongside the 1-byte 'Q'
-/// tag + 2-byte packing length prefix (1200 + 3 = 1203 ≤ 1275).
+/// Tuned for the Opus-frame substrate: cap UDP payloads so each
+/// datagram fits in an Opus frame alongside the 1-byte 'Q' tag, the
+/// 2-byte packing length prefix **and** the 27-byte E2E envelope
+/// (1150 + 3 + 27 = 1180 ≤ 1275 — see `e2e::E2E_OVERHEAD`).
 /// Disable PMTU discovery — there's no real path to probe.
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
@@ -618,7 +619,7 @@ pub fn build_endpoint(
     // Mirror the per-connection MTU cap. EndpointConfig also enforces
     // a payload-size ceiling that's checked separately from
     // TransportConfig — both have to agree.
-    let _ = endpoint_config.max_udp_payload_size(1200);
+    let _ = endpoint_config.max_udp_payload_size(1150);
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
     // `Endpoint::new_with_abstract_socket` spawns an internal driver
     // task via `tokio::spawn`, which requires a current tokio runtime.
