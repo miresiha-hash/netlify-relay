@@ -2452,6 +2452,7 @@ dependencies = [
  "parking_lot",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "serde_json",
  "socket2 0.5.10",

@@ -19,6 +19,10 @@ description = "LiveKit-backed tunnel client: session-keyed connect/send/recv ove
 crate-type = ["lib"]
 
 [dependencies]
+# E2E payload sealing (src/e2e.rs): X25519 + HKDF-SHA256 +
+# ChaCha20-Poly1305 — the SFU is an untrusted relay. Already in the
+# lockfile transitively via rustls, so no new dependency tree.
+ring = "0.17"
 # Signaling-trait surface for the `manager` module. Pure abstraction
 # (PeerId / TransportSession / Signaling / IncomingHandler) — no
 # transport coupling.
