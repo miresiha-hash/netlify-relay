@@ -76,6 +76,11 @@ pub async fn run_with_shutdown(
     // with "dispatcher not running". Idempotent.
     lktunnel::dispatcher::init();
 
+    // Pull a pre-fix config (token included) over from the default
+    // location when this daemon runs with a custom --config-dir —
+    // before the split-brain fix the file was persisted next to the
+    // binary instead of the flag dir.
+    crate::config::migrate_config_dir(&cfg.config_dir);
     let config_file = Arc::new(ConfigFile::new(cfg.config_dir.clone()));
     // Snapshot the persisted lists / cap so ServerState starts
     // pre-seeded — the UI handlers write through to disk on

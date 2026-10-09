@@ -1642,6 +1642,24 @@ async fn run_tunnel_loop(
                 // for the `'K'` frame); send_ip stays fail-closed
                 // until this completes.
                 tunnel.start_e2e_handshake();
+                // The SFU can drop a Hello published before the
+                // responder's subscription is attached, so keep
+                // retransmitting (Hello → Finish) until both sides
+                // establish or the handshake fails. Bounded:
+                // 40 × 750 ms ≈ 30 s, then we stay fail-closed.
+                let retry = Arc::clone(&tunnel);
+                runtime().spawn(async move {
+                    for _ in 0..40 {
+                        tokio::time::sleep(Duration::from_millis(750)).await;
+                        if retry.e2e_retry_tick() {
+                            return;
+                        }
+                    }
+                    log::warn!(
+                        "LkTunnel[{}]: e2e handshake did not establish within 30s — staying fail-closed",
+                        retry.id
+                    );
+                });
                 runtime().spawn(async move {
                     if let Err(e) = tunnel.ensure_quic_client().await {
                         log::warn!("auto ensure_quic_client failed: {e} — \
@@ -1762,6 +1780,43 @@ impl LkTunnel {
         if let Err(e) = self.send_raw_frame(hello, 0) {
             log::warn!("LkTunnel[{}]: e2e hello send failed: {e:?}", self.id);
         }
+    }
+
+    /// One tick of the initiator-side handshake retry loop.
+    ///
+    /// Returns `true` when the loop should stop. Before the session
+    /// establishes, the stored Hello frame is retransmitted — the
+    /// SFU can drop a frame published before the peer's subscription
+    /// is attached (observed as a one-shot handshake that never
+    /// completed). After establishing, the Finish frame keeps going
+    /// until a sealed frame from the responder opens: that open is
+    /// proof the responder reached Established too.
+    fn e2e_retry_tick(&self) -> bool {
+        let frame = {
+            let guard = self.e2e.lock();
+            if guard.failed() {
+                return true;
+            }
+            if guard.established() {
+                let (_, opens, _) = guard.stats();
+                if opens > 0 {
+                    return true;
+                }
+                match guard.retransmit_finish() {
+                    Some(f) => f,
+                    None => return true,
+                }
+            } else {
+                match guard.retransmit_hello() {
+                    Some(f) => f,
+                    None => return true,
+                }
+            }
+        };
+        if let Err(e) = self.send_raw_frame(frame, 0) {
+            log::debug!("LkTunnel[{}]: e2e retransmit failed: {e:?}", self.id);
+        }
+        false
     }
 
     /// Handle an inbound handshake frame. The reply (if any) goes
