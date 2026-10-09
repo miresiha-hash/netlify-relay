@@ -387,8 +387,43 @@ async fn connect(
             s.token_store.save(t.as_bytes());
         }
     }
+
+    // A daemon boots with the live peer cleared (no auto-dial at
+    // start), but the last selection survives on disk. Hydrate it
+    // here so a restart only needs `/connect` — without this every
+    // restart forced a manual `/tunnel/config` round-trip first.
+    // Gated to client mode: in server mode the peer is meaningless
+    // and a kick would needlessly restart the server loop.
+    let mut kick: Option<String> = None;
+    {
+        let mut cfg = s.cfg.write().await;
+        if cfg.mode.as_deref() == Some("client")
+            && (cfg.peer_id.is_none() || cfg.socks5_port == 0)
+        {
+            let persisted = s.config_file.load();
+            let mut changed = false;
+            if cfg.peer_id.is_none() && persisted.peer_id.is_some() {
+                cfg.peer_id = persisted.peer_id;
+                changed = true;
+            }
+            if cfg.socks5_port == 0 && persisted.socks5_port != 0 {
+                cfg.socks5_port = persisted.socks5_port;
+                changed = true;
+            }
+            if changed {
+                // Same kick set_config uses: `run_client` reads the
+                // peer once per entry, so republish the current mode
+                // to re-enter the loop with the hydrated cfg.
+                kick = cfg.mode.clone();
+            }
+        }
+    }
+
     s.signaling.connect().await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if let Some(mode) = kick {
+        let _ = s.mode_tx.send(Some(mode));
+    }
     Ok(Json(OkBody { ok: true }))
 }
 
