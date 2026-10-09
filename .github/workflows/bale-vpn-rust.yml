@@ -33,7 +33,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os:           ubuntu-latest
+          # ubuntu-22.04 (glibc 2.35), NOT ubuntu-latest: the deploy
+          # target (Pouya's VPS) runs Ubuntu 22.04, and a binary built
+          # on ubuntu-latest (24.04, glibc 2.39) refuses to load there
+          # ("GLIBC_2.39 not found"). Build against the OLDEST glibc we
+          # care about; newer distros load it fine.
+          - os:           ubuntu-22.04
             artifact_os:  linux-x86_64
             bin_ext:      ''
           - os:           macos-latest
@@ -106,13 +111,17 @@ jobs:
             ~/.cargo/bin
             lktunnel-rust/target
             bale-vpn-rust/target
-          # Key on artifact_os, not runner.os: macos-latest (arm64) and
-          # macos-26-intel (x86_64) both report runner.os == "macOS", so a
-          # shared key would let the Intel runner restore the arm64
-          # runner's ~/.cargo/bin + target (wrong-arch toolchain/objects).
-          key: bale-vpn-rust-${{ matrix.artifact_os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-rust/Cargo.toml') }}
+          # Key on matrix.os, not runner.os and not artifact_os: the
+          # macOS runners both report runner.os == "macOS" (a shared key
+          # would cross-restore arm64/x86_64 objects), and artifact_os
+          # can't distinguish runner IMAGES either (ubuntu-22.04 vs a
+          # future ubuntu-latest share "linux-x86_64" but not glibc —
+          # restoring a 24.04-built target dir on 22.04 breaks every
+          # build script). matrix.os is unique per matrix row AND pinned
+          # to the exact image.
+          key: bale-vpn-rust-${{ matrix.os }}-${{ hashFiles('lktunnel-rust/Cargo.lock', 'bale-vpn-rust/Cargo.toml') }}
           restore-keys: |
-            bale-vpn-rust-${{ matrix.artifact_os }}-
+            bale-vpn-rust-${{ matrix.os }}-
 
       # GUI binary — default features (`gui` is on by default;
       # produces the windowed desktop variant). The same binary
