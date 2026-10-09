@@ -322,7 +322,7 @@ impl E2eSession {
         if let Some(psk) = self.psk {
             ikm.extend_from_slice(&psk);
         }
-        let prk = hkdf::Salt::new(hkdf::SHA256, &self.t1).extract(&ikm);
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &self.t1).extract(&ikm);
         let mut tx = [0u8; KEY_LEN];
         let mut rx = [0u8; KEY_LEN];
         let mut auth = [0u8; KEY_LEN];

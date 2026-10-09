@@ -1760,7 +1760,7 @@ impl LkTunnel {
             }
         };
         if let Err(e) = self.send_raw_frame(hello, 0) {
-            log::warn!("LkTunnel[{}]: e2e hello send failed: {e}", self.id);
+            log::warn!("LkTunnel[{}]: e2e hello send failed: {e:?}", self.id);
         }
     }
 
@@ -1781,7 +1781,7 @@ impl LkTunnel {
         };
         if let Some(frame) = reply {
             if let Err(e) = self.send_raw_frame(frame, 0) {
-                log::warn!("LkTunnel[{}]: e2e handshake reply send failed: {e}", self.id);
+                log::warn!("LkTunnel[{}]: e2e handshake reply send failed: {e:?}", self.id);
             }
         }
         if self.e2e.lock().established() {
