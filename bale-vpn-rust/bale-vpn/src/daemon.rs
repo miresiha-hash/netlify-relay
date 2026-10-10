@@ -579,13 +579,10 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
 
     // ── Carrier selection ───────────────────────────────────────
     // The user's pick arrives as a CarrierKind in Resolved.
-    // Only Voice is wired to a transport today (the LiveKit
-    // engine below); Text/File/God resolve through
-    // `effective()` to Voice, so the selector is live now and
-    // the transports fill in behind it without a second round
-    // of plumbing. When Text/File land, the block here becomes
-    // the branch that dials *their* transport instead of
-    // `LkTunnel::connect`.
+    // Voice still resolves through `effective()` to itself (the
+    // LiveKit engine below), Text is its own transport reached by
+    // the branch after `resolve_peer`, and File/God still fall
+    // back to Voice until they grow a byte path of their own.
     let (carrier, peer_id_str, socks5_port, client_tun) = {
         let cfg = state.cfg.read().await;
         (cfg.carrier, cfg.peer_id.clone(), cfg.socks5_port, cfg.client_tun)
@@ -606,10 +603,22 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
         std::future::pending::<()>().await;
         return Ok(());
     };
-    log::info!("client: placing call to peer {peer_id_str}");
+    log::info!("client: dialing peer {peer_id_str}");
 
     let peer = state.signaling.resolve_peer(&peer_id_str).await
         .ok_or("client: unknown peer (resolve_peer returned None)")?;
+
+    // ── Text carrier: no call, no LK ────────────────────────────
+    // Text mode speaks straight to the peer over Bale text
+    // messages, so everything below — place_call, the LK room,
+    // ReliabilitySocket, the SOCKS5 listener — does not apply and
+    // is skipped entirely rather than run and torn down. There is
+    // no session-ended event to wait for here: tearing this down
+    // is the mode-switch `select!` in `run_one_mode` dropping this
+    // future, which runs `text_client`'s teardown guard.
+    if effective == crate::carrier::CarrierKind::Text {
+        return crate::text_client::run(state.signaling.clone(), peer).await;
+    }
 
     // Tunnel lifecycle → notify the parked run_client via a
     // oneshot. LK is the sole authority: a `Disconnected` from
