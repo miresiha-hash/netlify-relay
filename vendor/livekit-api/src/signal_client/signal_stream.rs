@@ -116,6 +116,15 @@ impl SignalStream {
         request
             .headers_mut()
             .insert("accept-language", HeaderValue::from_static("en-US,en;q=0.9"));
+        // Every real Chrome offers permessage-deflate; tungstenite has no
+        // compression support left, so we emit the offer ourselves. The
+        // Go signal server never negotiates it (no deflate implementation
+        // upstream), so frames stay uncompressed and nothing has to be
+        // encoded/decoded — the offer is purely handshake-parity.
+        request.headers_mut().insert(
+            "sec-websocket-extensions",
+            HeaderValue::from_static("permessage-deflate; client_max_window_bits"),
+        );
 
         #[cfg(feature = "signal-client-tokio")]
         let ws_stream = {

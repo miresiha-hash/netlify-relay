@@ -215,9 +215,11 @@ default-features = false
 
 [dependencies.tokio-tungstenite]
 version = "0.29"
-# "deflate" = offer permessage-deflate on the handshake, exactly like
-# every real browser does; without it the upgrade request is a tell.
-features = ["url", "deflate"]
+# Note: tokio-tungstenite/tungstenite carry no deflate feature (upstream
+# dropped compression). The permessage-deflate offer every real browser
+# sends is therefore emitted manually as a request header — see
+# signal_stream.rs. Features otherwise match the published crate.
+features = ["url"]
 optional = true
 
 [dependencies.url]
