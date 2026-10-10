@@ -1190,9 +1190,10 @@ impl LkTunnel {
             Err(e) => { cleanup(); return Err(e); }
         };
         endpoint.set_default_client_config(client_config);
-        // "lktunnel" matches the SAN in the self-signed cert built
-        // by `make_server_config`.
-        let connecting = match endpoint.connect(quic_tunnel::peer_sentinel_addr(), "lktunnel") {
+        // SNI only: peer cert validation is skipped (`SkipServerVerify`),
+        // but this string goes out in the clear in QUIC's ClientHello —
+        // keep it neutral, never a project name.
+        let connecting = match endpoint.connect(quic_tunnel::peer_sentinel_addr(), "localhost") {
             Ok(c)  => c,
             Err(e) => { cleanup(); return Err(e.into()); }
         };

@@ -27,8 +27,13 @@ lto           = "thin"
 codegen-units = 1
 panic         = "abort"
 
-# The libwebrtc carrier is gone — the transport now rides `webrtc-rs`
-# (pure Rust) via the `rtc` module in `lktunnel`, with the reused
-# crates.io `livekit-api` (signal client; `sdk=js` is set through
-# `SignalSdkOptions`, no fork needed) and `livekit-protocol` (wire
-# types). No vendored crates, no webrtc-sys/libwebrtc/livekit patch.
+# ─── Stealth patch: local `livekit-api` copy ─────────────────────────────
+# Same release as crates.io (0.4.24), wire-identical transport, but the
+# join surface matches Bale's own web client instead of the rust-sdks
+# fingerprint: protocol=16, no os/device_model/capabilities/
+# client_protocol on the v0 query, ClientInfo = {sdk, version, protocol},
+# access_token as first query param, and browser handshake headers
+# (Origin web.bale.ai + full Chrome UA + Accept-Language) on the signal
+# WebSocket. Update this path if `vendor/livekit-api` ever moves.
+[patch.crates-io]
+livekit-api = { path = "../vendor/livekit-api" }
