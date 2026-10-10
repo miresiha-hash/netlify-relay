@@ -13,6 +13,13 @@ use std::time::Duration;
 
 const ORIGIN: &str = "https://web.bale.ai";
 
+// Full browser UA (kept in sync with ws.rs — a bare "Mozilla/5.0"
+// or a missing UA header is a non-browser tell on every REST call).
+#[cfg(target_os = "android")]
+const BROWSER_UA: &str = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.25 Mobile Safari/537.36";
+#[cfg(not(target_os = "android"))]
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.13 Safari/537.36";
+
 /// Errors surfaced to callers (BaleAuth, contact RPCs, …).
 #[derive(Debug)]
 pub enum GrpcError {
@@ -163,6 +170,7 @@ pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .https_only(true)
+        .user_agent(BROWSER_UA)
         .build()
         .expect("rustls Client build")
 }
@@ -176,6 +184,7 @@ pub fn build_client_with_jar(jar: std::sync::Arc<reqwest::cookie::Jar>) -> reqwe
         .timeout(Duration::from_secs(30))
         .https_only(true)
         .cookie_provider(jar)
+        .user_agent(BROWSER_UA)
         .build()
         .expect("rustls Client build")
 }

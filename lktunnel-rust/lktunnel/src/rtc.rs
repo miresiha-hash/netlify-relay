@@ -53,7 +53,31 @@ use crate::rtp;
 /// SFU keys some behaviour off this; the LiveKit JS SDK is what its web
 /// client uses, so we match it.
 const IMPERSONATE_SDK: &str = "js";
-const IMPERSONATE_SDK_VERSION: &str = "2.13.6";
+// Version we advertise as LiveKit-JS. Bale's own web bundle
+// (web.bale.ai/static/js/async/*, LiveKit client `aH` const) currently
+// ships "2.18.9" — keep this pinned to Bale's value, never to upstream
+// rust-sdks defaults (they used a stale 2.13.6 = instant signature).
+const IMPERSONATE_SDK_VERSION: &str = "2.18.9";
+
+/// Random v4 UUID shaped exactly like a Chrome `mediaStreamTrack.id`
+/// (used for AddTrack `cid`/`name` and the SDP msid stream id).
+/// Never reuse static names here: they are plaintext to the SFU.
+fn media_track_uuid() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut b = [0u8; 16];
+    SystemRandom::new().fill(&mut b).expect("system rng is unavailable");
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let hex = |bytes: &[u8]| bytes.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&b[0..4]),
+        hex(&b[4..6]),
+        hex(&b[6..8]),
+        hex(&b[8..10]),
+        hex(&b[10..16])
+    )
+}
 
 /// Bounded per-track send queue. `RtpSender::send` is the backpressure
 /// surface: a full queue returns false so the send loop retries across
@@ -205,6 +229,13 @@ impl Engine {
         }
 
         // ── Publish the outgoing carrier track(s) ─────────────────────
+        // Per-session, browser-shaped identifiers: a real Chrome client
+        // names its track with a random UUID (AddTrack `name`/`cid` and
+        // the SDP msid all match `mediaStreamTrack.id`). The old static
+        // "tunnel-N"/"tunnel-stream" strings were visible to the SFU in
+        // every session — a channel-wide signature shared with the
+        // public upstream repo.
+        let stream_id = media_track_uuid();
         let mut senders = Vec::with_capacity(rtp::TRACK_COUNT);
         for index in 0..rtp::TRACK_COUNT {
             let track = Arc::new(TrackLocalStaticSample::new(
@@ -214,8 +245,8 @@ impl Engine {
                     channels: 2,
                     ..Default::default()
                 },
-                format!("tunnel-{index}"),
-                "tunnel-stream".to_string(),
+                media_track_uuid(),
+                stream_id.clone(),
             ));
             publisher
                 .add_track(track.clone())
@@ -224,7 +255,8 @@ impl Engine {
             signal
                 .send(proto::signal_request::Message::AddTrack(proto::AddTrackRequest {
                     cid: track.id().to_string(),
-                    name: format!("tunnel-{index}"),
+                    // Stock clients publish `name` = mediaStreamTrack.id.
+                    name: track.id().to_string(),
                     r#type: proto::TrackType::Audio as i32,
                     source: proto::TrackSource::Microphone as i32,
                     // No `disable_dtx`: that gated libwebrtc's Opus encoder.

@@ -35,6 +35,15 @@ pub const API_VERSION:   i64  = 151_668;
 /// pending entry forever.
 const RPC_TIMEOUT_SECS: u64 = 30;
 
+// Full browser User-Agent for every request we send to Bale: a bare
+// "Mozilla/5.0" (the old value) is sent by no real browser and
+// fingerprints every session instantly. Matched to current Chrome
+// stable; desktop UA on non-Android builds, Mobile Chrome on Android.
+#[cfg(target_os = "android")]
+const BROWSER_UA: &str = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.25 Mobile Safari/537.36";
+#[cfg(not(target_os = "android"))]
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.8078.13 Safari/537.36";
+
 // ─── Public types ───────────────────────────────────────────────────────
 
 /// Full Bale CallEntity. Mirrors `CallEntity` in
@@ -1286,7 +1295,8 @@ fn build_upgrade_request(token: &str) -> tungstenite::http::Request<()> {
         .header("Host",       WS_HOST)
         .header("Cookie",     format!("access_token={token}"))
         .header("Origin",     "https://web.bale.ai")
-        .header("User-Agent", "Mozilla/5.0")
+        .header("User-Agent", BROWSER_UA)
+        .header("Accept-Language", "en-US,en;q=0.9")
         .header("Upgrade",    "websocket")
         .header("Connection", "upgrade")
         .header("Sec-WebSocket-Version", "13")

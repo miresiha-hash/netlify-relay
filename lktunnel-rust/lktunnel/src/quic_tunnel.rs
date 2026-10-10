@@ -355,8 +355,11 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 pub fn make_server_config() -> Result<quinn::ServerConfig, QuicConfigError> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
+    // SAN = "localhost": this cert only exists inside the encrypted
+    // tunnel (nothing clear-text ever carries it), so a project-specific
+    // SAN like the old "lktunnel" has no reason to exist.
     let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(vec!["lktunnel".to_string()])
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .map_err(|e| QuicConfigError::Cert(e.to_string()))?;
     let cert_der: CertificateDer<'static> = cert.der().clone();
     let key_pkcs8: PrivatePkcs8KeyDer<'static> =
