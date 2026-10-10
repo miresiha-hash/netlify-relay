@@ -6,7 +6,7 @@
 use crate::contacts::{self, UserEntity};
 use crate::grpc_web;
 use crate::peer::BalePeer;
-use crate::ws::{CallEntity, WsClient};
+use crate::ws::{CallEntity, TextMessageCb, WsClient};
 
 use async_trait::async_trait;
 use lk_signaling::{
@@ -379,6 +379,37 @@ impl BaleSignaling {
         *self.contact_cache.lock() = Some(users.clone());
         Ok(users)
     }
+
+    /// Outbound half of the text transport — see
+    /// [`WsClient::send_text_message`]. Returns the `rid` the
+    /// message was filed under (the inbound `newMessage` push
+    /// echoes it back, so a caller can recognize its own echo).
+    ///
+    /// `access_hash` is passed as `0`: `SendMessage` accepts it
+    /// for private peers (probed live against Bale), and
+    /// [`PeerId`] is an identity token here — it deliberately
+    /// doesn't carry the hash.
+    pub async fn send_text_message(
+        &self,
+        p:    &PeerId,
+        text: &str,
+    ) -> Result<i64, SignalingError> {
+        if !self.is_authenticated() {
+            return Err(SignalingError::NotAuthenticated);
+        }
+        let uid = p.id_str().parse::<i32>()
+            .map_err(|_| SignalingError::Transport("peer id is not a Bale uid".into()))?;
+        self.ws.send_text_message(uid, 0, text).await
+            .map_err(|e| SignalingError::Transport(format!("SendMessage failed: {e}")))
+    }
+
+    /// Inbound half of the text transport: register a listener for
+    /// text messages arriving on the `f=2` push path (xC member
+    /// 55). Forwards to [`WsClient::add_on_text_message`]; wiring
+    /// done directly on the WS client keeps working alongside it.
+    pub fn add_on_text_message(&self, cb: TextMessageCb) {
+        self.ws.add_on_text_message(cb);
+    }
 }
 
 fn grpc_to_signaling(e: crate::grpc_web::GrpcError) -> SignalingError {
@@ -743,5 +774,55 @@ mod tests {
             ..Default::default()
         })).await;
         assert!(s.active_peers.lock().is_empty());
+    }
+
+    // ── text transport ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_text_message_requires_auth() {
+        let s = BaleSignaling::new(store_empty());
+        let p = s.resolve_peer("42").await.unwrap();
+        assert!(matches!(
+            s.send_text_message(&p, "hi").await,
+            Err(SignalingError::NotAuthenticated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_text_message_without_ws_reports_transport_error() {
+        let s = BaleSignaling::new(store_with("tok"));
+        let p = s.resolve_peer("42").await.unwrap();
+        // Authenticated but never connected — no sender on the WS,
+        // so the RPC layer reports NotConnected and the impl wraps
+        // it as a Transport error rather than pretending to send.
+        assert!(matches!(
+            s.send_text_message(&p, "hi").await,
+            Err(SignalingError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn text_message_push_reaches_public_listener() {
+        let s   = BaleSignaling::new(store_empty());
+        let got = Arc::new(Mutex::new(None::<crate::ws::TextMessage>));
+        let got_cb = got.clone();
+        s.add_on_text_message(Arc::new(move |m| *got_cb.lock() = Some(m)));
+
+        // Same hand-assembled `f=2` container as the ws-level
+        // byte-exact test — public entry point, same bytes.
+        let frame = [
+            0x0A, 0x1F, 0x0A, 0x1D, 0xBA, 0x03, 0x1A, 0x08,
+            0x63, 0x10, 0xFB, 0xD0, 0x95, 0xFF, 0xBC, 0x31,
+            0x18, 0xC8, 0xD3, 0x95, 0xFF, 0xBC, 0x31, 0x22,
+            0x08, 0x7A, 0x06, 0x0A, 0x04, 0x70, 0x69, 0x6E,
+            0x67,
+        ];
+        crate::ws::handle_push_container(&s.ws, &frame).unwrap();
+
+        let m = got.lock().clone();
+        let m = m.expect("listener should have fired");
+        assert_eq!(m.sender_uid, 99);
+        assert_eq!(m.rid, 1_700_000_000_123);
+        assert_eq!(m.text, "ping");
     }
 }

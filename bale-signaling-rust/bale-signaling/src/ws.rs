@@ -81,6 +81,30 @@ pub struct SelfInfo {
 /// didn't carry the field.
 pub type CallReceivedCb = Arc<dyn Fn(i64, Option<CallEntity>) + Send + Sync>;
 pub type CallEndedCb    = Arc<dyn Fn(i64, i32) + Send + Sync>;
+
+/// An inbound chat message that carried a `textMessage` content —
+/// the inbound half of the text transport, surfaced by the `f=2`
+/// push path (xC member [`XC_NEW_MESSAGE`]).
+///
+/// Wire shape, verified against Bale's web bundle:
+///
+/// ```text
+/// Message   { 1 senderUid (int32), 2 rid (int64), 3 date (int64),
+///             4 message (Content) }
+/// Content   { 15 = TextMessage { 1 text (string) } }
+/// ```
+///
+/// Sibling `Content` members (photo / file / sticker / …) decode to
+/// [`None`] and fire no callback.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TextMessage {
+    pub sender_uid: i32,
+    pub rid:        i64,
+    pub date:       i64,
+    pub text:       String,
+}
+
+pub type TextMessageCb = Arc<dyn Fn(TextMessage) + Send + Sync>;
 pub type CallAcceptedCb = Arc<dyn Fn(i64) + Send + Sync>;
 pub type Notifier       = Arc<dyn Fn() + Send + Sync>;
 
@@ -498,6 +522,124 @@ const XC_CALL_ACCEPTED: u32 = 52808;
 const XC_CALL_ENDED:    u32 = 52809;
 const XC_CALL_RECEIVED: u32 = 52810;
 
+/// Chat-housekeeping members the Kotlin port logged and skipped;
+/// `XC_NEW_MESSAGE` is the one that carries real content (a
+/// `Message` entity) and is now decoded by [`parse_text_message`].
+const XC_MESSAGE_READ:        u32 = 19;
+const XC_MESSAGE_READ_BY_ME:  u32 = 50;
+const XC_NEW_MESSAGE:         u32 = 55;
+const XC_EMPTY_UPDATE:        u32 = 85;
+
+// ─── messaging transport ────────────────────────────────────────────────
+
+/// `SendMessage` RPC service / method for the text-transport
+/// channel (`bale-messaging-v2`).
+const MESSAGING_SERVICE: &str = "bale.messaging.v2.Messaging";
+const MESSAGING_SEND:    &str = "SendMessage";
+
+/// `OutPeer.peerType` — a private (1:1) chat.
+const PEERTYPE_PRIVATE: i32 = 1;
+
+/// `Content` union member carrying `TextMessage { 1 text }`.
+const CONTENT_TEXT_MESSAGE: u32 = 15;
+
+/// `SendMessageRequest { 1 peer, 2 rid, 3 message }` payload for
+/// [`WsClient::send_text_message`]:
+///
+/// ```text
+/// OutPeer { 1 peerType=PRIVATE, 2 uid, 3 accessHash }
+/// Content { 15 TextMessage { 1 text } }
+/// ```
+///
+/// Pure (no clock, no RPC) so the byte layout can be pinned by a
+/// unit test against hand-computed bytes.
+pub(crate) fn build_send_text_payload(
+    uid:         i32,
+    access_hash: i64,
+    rid:         i64,
+    text:        &str,
+) -> Vec<u8> {
+    let out_peer = ProtoWriter::new()
+        .int32(1, PEERTYPE_PRIVATE)
+        .int32(2, uid)
+        .int64(3, access_hash)
+        .build();
+    let text_message = ProtoWriter::new().string(1, text).build();
+    let content      = ProtoWriter::new().bytes(CONTENT_TEXT_MESSAGE, &text_message).build();
+    ProtoWriter::new()
+        .bytes(1, &out_peer)
+        .int64(2, rid)
+        .bytes(3, &content)
+        .build()
+}
+
+/// Decode an xC [`XC_NEW_MESSAGE`] body into a [`TextMessage`].
+///
+/// Body = `Message { 1 senderUid, 2 rid, 3 date, 4 message (Content) }`
+/// where `Content` member 15 is `TextMessage { 1 text }`. Returns
+/// `None` for non-text content (photo / file / …), a body without
+/// a text payload, or a malformed body.
+///
+/// A single wrapper level is also accepted: in this push family
+/// `callEnded` carries its entity under field 1 rather than bare,
+/// and no earlier port ever decoded *this* member's body, so the
+/// wrapped form can't be ruled out from client evidence.
+pub(crate) fn parse_text_message(raw: &[u8]) -> Option<TextMessage> {
+    if let Some(msg) = parse_message_body(raw) { return Some(msg); }
+    let mut r = ProtoReader::new(raw);
+    while r.has_more() {
+        let (f, w) = r.tag().ok()?;
+        if f == 1 && w == 2 {
+            return parse_message_body(r.bytes().ok()?);
+        }
+        r.skip(w).ok()?;
+    }
+    None
+}
+
+/// Field-level decode of the `Message` entity — see
+/// [`parse_text_message`] for the schema. `None` unless a
+/// `textMessage` content was actually found.
+fn parse_message_body(raw: &[u8]) -> Option<TextMessage> {
+    let mut sender_uid = 0i32;
+    let mut rid        = 0i64;
+    let mut date       = 0i64;
+    let mut text: Option<String> = None;
+    let mut r = ProtoReader::new(raw);
+    while r.has_more() {
+        let (f, w) = r.tag().ok()?;
+        match f {
+            1 if w == 0 => sender_uid = r.varint().ok()? as i32,
+            2 if w == 0 => rid        = r.varint().ok()? as i64,
+            3 if w == 0 => date       = r.varint().ok()? as i64,
+            4 if w == 2 => text = parse_text_content(r.bytes().ok()?),
+            _           => r.skip(w).ok()?,
+        }
+    }
+    text.map(|text| TextMessage { sender_uid, rid, date, text })
+}
+
+/// Pull the string out of a `Content` union body — only member 15
+/// (`TextMessage { 1 text }`) matters for this transport.
+fn parse_text_content(raw: &[u8]) -> Option<String> {
+    let mut r = ProtoReader::new(raw);
+    while r.has_more() {
+        let (f, w) = r.tag().ok()?;
+        if f == CONTENT_TEXT_MESSAGE && w == 2 {
+            let inner = r.bytes().ok()?;
+            let mut t = ProtoReader::new(inner);
+            while t.has_more() {
+                let (tf, tw) = t.tag().ok()?;
+                if tf == 1 && tw == 2 { return t.string().ok(); }
+                t.skip(tw).ok()?;
+            }
+            return None;
+        }
+        r.skip(w).ok()?;
+    }
+    None
+}
+
 // ─── RPC pending machinery ──────────────────────────────────────────────
 
 /// One in-flight RPC. The `service` / `method` fields are kept for
@@ -610,11 +752,16 @@ pub struct WsClient {
     /// Monotonic counter for ping idx — just a value the server
     /// can echo. Doesn't matter for behaviour.
     ping_counter:      AtomicI32,
+    /// Monotonic floor for outbound messaging `rid`s — see
+    /// [`Self::next_rid`]. `0` = nothing sent yet.
+    last_rid:          AtomicI64,
 
     // ── Listener lists ────────────────────────────────────────
     on_call_received:  Mutex<Vec<CallReceivedCb>>,
     on_call_ended:     Mutex<Vec<CallEndedCb>>,
     on_call_accepted:  Mutex<Vec<CallAcceptedCb>>,
+    /// Inbound text messages pushed on the `f=2` path.
+    on_text_message:   Mutex<Vec<TextMessageCb>>,
     on_token_expired:  Mutex<Option<Notifier>>,
     on_version_mism:   Mutex<Option<Notifier>>,
 
@@ -645,9 +792,11 @@ impl WsClient {
             subscribe_backoff_ms: AtomicU64::new(0),
             last_inbound_ts:  AtomicI64::new(0),
             ping_counter:     AtomicI32::new(0),
+            last_rid:         AtomicI64::new(0),
             on_call_received: Mutex::new(Vec::new()),
             on_call_ended:    Mutex::new(Vec::new()),
             on_call_accepted: Mutex::new(Vec::new()),
+            on_text_message:  Mutex::new(Vec::new()),
             on_token_expired: Mutex::new(None),
             on_version_mism:  Mutex::new(None),
             self_info:        Mutex::new(None),
@@ -789,6 +938,10 @@ impl WsClient {
     pub(crate) fn fire_call_accepted(&self, call_id: i64) {
         let listeners = self.on_call_accepted.lock().clone();
         for cb in listeners { cb(call_id); }
+    }
+    pub(crate) fn fire_text_message(&self, msg: TextMessage) {
+        let listeners = self.on_text_message.lock().clone();
+        for cb in listeners { cb(msg.clone()); }
     }
     pub(crate) fn fire_token_expired(&self) {
         let cb = self.on_token_expired.lock().clone();
@@ -952,6 +1105,10 @@ impl WsClient {
     pub fn add_on_call_received(&self, cb: CallReceivedCb) { self.on_call_received.lock().push(cb); }
     pub fn add_on_call_ended   (&self, cb: CallEndedCb)    { self.on_call_ended.lock().push(cb); }
     pub fn add_on_call_accepted(&self, cb: CallAcceptedCb) { self.on_call_accepted.lock().push(cb); }
+    /// Register an inbound text-message listener (the inbound half
+    /// of the text transport). Fans out to every registered cb on
+    /// the `f=2` push path — see [`parse_text_message`].
+    pub fn add_on_text_message(&self, cb: TextMessageCb)    { self.on_text_message.lock().push(cb); }
     pub fn set_on_token_expired(&self, cb: Notifier)       { *self.on_token_expired.lock() = Some(cb); }
     pub fn set_on_version_mismatch(&self, cb: Notifier)    { *self.on_version_mism.lock()  = Some(cb); }
 
@@ -1006,6 +1163,42 @@ impl WsClient {
         if let Err(e) = self.rpc_call("bale.meet.v1.Meet", "DiscardCall", &payload).await {
             log::debug!("discardCall({call_id}) failed: {e}");
         }
+    }
+
+    /// `bale.messaging.v2.Messaging/SendMessage` — outbound half of
+    /// the text transport: send `text` to a private peer.
+    ///
+    /// Payload layout (proven against Bale's web client, see
+    /// [`build_send_text_payload`]): `OutPeer { 1 type, 2 uid,
+    /// 3 accessHash }`, `rid`, `Content { 15 TextMessage { 1 text } }`.
+    /// `access_hash` may be `0` — Bale accepts it for private peers.
+    ///
+    /// Returns the `rid` the message was filed under; the same value
+    /// comes back on the inbound `newMessage` push, so a caller can
+    /// recognize its own echo.
+    pub async fn send_text_message(
+        &self,
+        uid: i32,
+        access_hash: i64,
+        text: &str,
+    ) -> Result<i64, RpcCallError> {
+        let rid     = self.next_rid();
+        let payload = build_send_text_payload(uid, access_hash, rid, text);
+        let _reply  = self.rpc_call(MESSAGING_SERVICE, MESSAGING_SEND, &payload).await?;
+        Ok(rid)
+    }
+
+    /// Monotonic request id for outbound messages. The wall clock
+    /// alone repeats inside a millisecond and Bale correlates
+    /// messages by `rid` (the `newMessage` push echoes it), so two
+    /// same-millisecond sends could collapse into one. Clamp the
+    /// clock to `last_rid + 1` instead.
+    fn next_rid(&self) -> i64 {
+        let now  = now_millis();
+        let prev = self.last_rid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| Some(p.max(now) + 1))
+            .unwrap_or(now);
+        prev.max(now) + 1
     }
 
     /// Resolve a user id to a display name via
@@ -1212,10 +1405,11 @@ pub(crate) fn handle_update_body(ws: &WsClient, body: &[u8]) -> Result<(), Proto
 }
 
 /// xC union dispatch. Fires the matching listener for each
-/// recognised call event tag; silently skips chat-housekeeping
-/// events (messageRead / messageReadByMe / newMessage /
-/// emptyUpdate — fields 19, 50, 55, 85) that the proxy doesn't
-/// act on.
+/// recognised event tag: call events (52807–52810) go to the call
+/// listeners, `XC_NEW_MESSAGE` (55) to the text-message listener
+/// via [`parse_text_message`]. Chat housekeeping that carries no
+/// content (messageRead / messageReadByMe / emptyUpdate — 19, 50,
+/// 85) is skipped silently.
 pub(crate) fn dispatch_xc(ws: &WsClient, body: &[u8]) -> Result<(), ProtoError> {
     let mut r = ProtoReader::new(body);
     while r.has_more() {
@@ -1257,8 +1451,15 @@ pub(crate) fn dispatch_xc(ws: &WsClient, body: &[u8]) -> Result<(), ProtoError> 
                     ws.fire_call_received(call_id, stub);
                 }
             }
-            19 | 50 | 55 | 85 => r.skip(w)?,    // chat housekeeping — silent
-            _                 => r.skip(w)?,    // unknown — also silent for now
+            XC_NEW_MESSAGE => {
+                let raw = r.bytes()?;
+                if let Some(msg) = parse_text_message(raw) {
+                    ws.fire_text_message(msg);
+                }
+            }
+            XC_MESSAGE_READ | XC_MESSAGE_READ_BY_ME | XC_EMPTY_UPDATE
+                => r.skip(w)?,    // chat housekeeping — silent
+            _                       => r.skip(w)?,    // unknown — also silent for now
         }
     }
     Ok(())
@@ -2468,23 +2669,235 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_xc_skips_unknown_and_chat_events() {
+    fn dispatch_xc_skips_unknown_and_empty_chat_events() {
         let ws = WsClient::new();
         let received_calls = Arc::new(parking_lot::Mutex::new(0u32));
         let cb = received_calls.clone();
         ws.add_on_call_received(Arc::new(move |_, _| *cb.lock() += 1));
+        let texts = Arc::new(parking_lot::Mutex::new(0u32));
+        let texts_cb = texts.clone();
+        ws.add_on_text_message(Arc::new(move |_| *texts_cb.lock() += 1));
 
-        // 19 messageRead + 55 newMessage + 85 emptyUpdate +
-        // some random unknown tag. None of these should fire
-        // listeners.
+        // 19 messageRead + 85 emptyUpdate + some random unknown tag
+        // must fire nothing. A `55 newMessage` member carrying an
+        // empty body must not fire the text listener either —
+        // there is no Message entity in it to decode.
         let buf = ProtoWriter::new()
-            .bytes(19, &[])
-            .bytes(55, &[])
-            .bytes(85, &[])
+            .bytes(XC_MESSAGE_READ, &[])
+            .bytes(XC_NEW_MESSAGE, &[])
+            .bytes(XC_EMPTY_UPDATE, &[])
             .int32(7777, 0)
             .build();
         dispatch_xc(&ws, &buf).unwrap();
         assert_eq!(*received_calls.lock(), 0);
+        assert_eq!(*texts.lock(), 0);
+    }
+
+    // ── text transport ────────────────────────────────────────
+
+    /// `SendMessageRequest` bytes, hand-computed from the
+    /// protobuf wire rules rather than from `ProtoWriter`:
+    /// ```text
+    ///   OutPeer{1=1, 2=42, 3=0}                08 01 10 2A 18 00
+    ///   rid=1                                  10 01
+    ///   Content{15=TextMessage{1="hi"}}        7A 04 0A 02 68 69
+    /// ```
+    #[test]
+    fn send_text_payload_is_byte_exact() {
+        assert_eq!(
+            build_send_text_payload(42, 0, 1, "hi"),
+            vec![
+                0x0A, 0x06, 0x08, 0x01, 0x10, 0x2A, 0x18, 0x00,
+                0x10, 0x01,
+                0x1A, 0x06, 0x7A, 0x04, 0x0A, 0x02, 0x68, 0x69,
+            ]
+        );
+    }
+
+    /// Same layout, but with the edges the trivial case misses:
+    /// uid=300 → 2-byte varint, access_hash=-2 → 10-byte two's
+    /// complement varint, rid=1700000000123 → 6-byte varint, and
+    /// a Persian string → 8 UTF-8 bytes (D8 B3 D9 84 D8 A7 D9 85).
+    #[test]
+    fn send_text_payload_handles_multibyte_varints_and_utf8() {
+        assert_eq!(
+            build_send_text_payload(300, -2, 1_700_000_000_123, "\u{633}\u{644}\u{627}\u{645}"),
+            vec![
+                0x0A, 0x10, 0x08, 0x01, 0x10, 0xAC, 0x02, 0x18,
+                0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0x01, 0x10, 0xFB, 0xD0, 0x95, 0xFF, 0xBC,
+                0x31, 0x1A, 0x0C, 0x7A, 0x0A, 0x0A, 0x08, 0xD8,
+                0xB3, 0xD9, 0x84, 0xD8, 0xA7, 0xD9, 0x85,
+            ]
+        );
+    }
+
+    /// The whole outbound frame: `{1:{1:service, 2:method,
+    /// 3:payload, 5:idx}}` with the *literal* service and method
+    /// spelled out. If either constant regressed this fails even
+    /// though `encode_rpc` itself is unchanged.
+    #[test]
+    fn send_message_frame_is_byte_exact() {
+        let payload = build_send_text_payload(42, 0, 1, "hi");
+        let frame   = encode_rpc(MESSAGING_SERVICE, MESSAGING_SEND, &payload, 1);
+        assert_eq!(
+            frame,
+            vec![
+                0x0A, 0x40, 0x0A, 0x1B, 0x62, 0x61, 0x6C, 0x65,
+                0x2E, 0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x69,
+                0x6E, 0x67, 0x2E, 0x76, 0x32, 0x2E, 0x4D, 0x65,
+                0x73, 0x73, 0x61, 0x67, 0x69, 0x6E, 0x67, 0x12,
+                0x0B, 0x53, 0x65, 0x6E, 0x64, 0x4D, 0x65, 0x73,
+                0x73, 0x61, 0x67, 0x65, 0x1A, 0x12, 0x0A, 0x06,
+                0x08, 0x01, 0x10, 0x2A, 0x18, 0x00, 0x10, 0x01,
+                0x1A, 0x06, 0x7A, 0x04, 0x0A, 0x02, 0x68, 0x69,
+                0x28, 0x01,
+            ]
+        );
+    }
+
+    /// Hand-assembled `f=2` container — bytes written by hand,
+    /// not by `ProtoWriter` — so the inbound half is pinned to
+    /// the same ground truth the outbound half is:
+    /// ```text
+    ///   {1:{1:{55: Message{1:99, 2:1700000000123,
+    ///                      3:1700000000456, 4:{15:{1:"ping"}}}}}}
+    /// ```
+    #[test]
+    fn push_container_fires_text_message_callback_byte_exact() {
+        let ws = WsClient::new();
+        let got  = Arc::new(parking_lot::Mutex::new(None::<TextMessage>));
+        let hits = Arc::new(parking_lot::Mutex::new(0u32));
+        let (got_cb, hits_cb) = (got.clone(), hits.clone());
+        ws.add_on_text_message(Arc::new(move |m| { *got_cb.lock() = Some(m); *hits_cb.lock() += 1; }));
+
+        let frame = [
+            0x0A, 0x1F, 0x0A, 0x1D, 0xBA, 0x03, 0x1A, 0x08,
+            0x63, 0x10, 0xFB, 0xD0, 0x95, 0xFF, 0xBC, 0x31,
+            0x18, 0xC8, 0xD3, 0x95, 0xFF, 0xBC, 0x31, 0x22,
+            0x08, 0x7A, 0x06, 0x0A, 0x04, 0x70, 0x69, 0x6E,
+            0x67,
+        ];
+        handle_push_container(&ws, &frame).unwrap();
+
+        assert_eq!(*hits.lock(), 1);
+        assert_eq!(
+            *got.lock(),
+            Some(TextMessage {
+                sender_uid: 99,
+                rid:        1_700_000_000_123,
+                date:       1_700_000_000_456,
+                text:       "ping".to_string(),
+            })
+        );
+    }
+
+    /// The wrapper hedge: the same entity nested one level deep
+    /// (`{1: Message{…}}`) — the shape `callEnded` uses in this
+    /// push family — must still decode.
+    #[test]
+    fn text_message_wrapper_form_is_decoded() {
+        let raw = [
+            0x0A, 0x1A, 0x08, 0x63, 0x10, 0xFB, 0xD0, 0x95,
+            0xFF, 0xBC, 0x31, 0x18, 0xC8, 0xD3, 0x95, 0xFF,
+            0xBC, 0x31, 0x22, 0x08, 0x7A, 0x06, 0x0A, 0x04,
+            0x70, 0x69, 0x6E, 0x67,
+        ];
+        let msg = parse_text_message(&raw).expect("wrapped body should decode");
+        assert_eq!(msg.sender_uid, 99);
+        assert_eq!(msg.text, "ping");
+    }
+
+    /// `newMessage` with a non-text `Content` member (a photo)
+    /// must not reach a text listener.
+    #[test]
+    fn non_text_content_does_not_fire_text_callback() {
+        let ws = WsClient::new();
+        let hits = Arc::new(parking_lot::Mutex::new(0u32));
+        let hits_cb = hits.clone();
+        ws.add_on_text_message(Arc::new(move |_| *hits_cb.lock() += 1));
+
+        let photo    = ProtoWriter::new().string(1, "photo.jpg").build();
+        let content  = ProtoWriter::new().bytes(3, &photo).build();
+        let entity   = ProtoWriter::new()
+            .int32(1, 99).int64(2, 7).int64(3, 8).bytes(4, &content)
+            .build();
+        let xc = ProtoWriter::new().bytes(XC_NEW_MESSAGE, &entity).build();
+        dispatch_xc(&ws, &xc).unwrap();
+        assert_eq!(*hits.lock(), 0);
+    }
+
+    /// End-to-end outbound: two sends against a fake transport.
+    /// First frame is pinned byte for byte (idx=1 on a fresh
+    /// client); both rids must come back, strictly increasing
+    /// even when both sends land in the same millisecond, and the
+    /// payload actually written to the wire must be the one the
+    /// builder produces for the rid we report.
+    #[tokio::test]
+    async fn send_text_message_sends_byte_exact_frame_and_returns_rid() {
+        let ws = WsClient::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        ws.install_sender(tx);
+
+        let mut prev_rid = 0i64;
+        for round in 0..2 {
+            let ws_inner = ws.clone();
+            let h = tokio::spawn(async move {
+                ws_inner.send_text_message(42, 0, "hi").await
+            });
+
+            let outgoing = rx.recv().await.expect("send_text_message should push a frame");
+
+            if round == 0 {
+                assert_eq!(
+                    outgoing,
+                    vec![
+                        0x0A, 0x40, 0x0A, 0x1B, 0x62, 0x61, 0x6C, 0x65,
+                        0x2E, 0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x69,
+                        0x6E, 0x67, 0x2E, 0x76, 0x32, 0x2E, 0x4D, 0x65,
+                        0x73, 0x73, 0x61, 0x67, 0x69, 0x6E, 0x67, 0x12,
+                        0x0B, 0x53, 0x65, 0x6E, 0x64, 0x4D, 0x65, 0x73,
+                        0x73, 0x61, 0x67, 0x65, 0x1A, 0x12, 0x0A, 0x06,
+                        0x08, 0x01, 0x10, 0x2A, 0x18, 0x00, 0x10, 0x01,
+                        0x1A, 0x06, 0x7A, 0x04, 0x0A, 0x02, 0x68, 0x69,
+                        0x28, 0x01,
+                    ]
+                );
+            }
+
+            // Pull idx and payload back out of the frame, then
+            // answer it like the server would.
+            let mut r = ProtoReader::new(&outgoing);
+            r.tag().unwrap();
+            let inner = r.bytes().unwrap();
+            let mut ir = ProtoReader::new(inner);
+            let mut idx     = 0i32;
+            let mut payload = Vec::new();
+            while ir.has_more() {
+                let (f, _) = ir.tag().unwrap();
+                match f {
+                    1 | 2 => { let _ = ir.string().unwrap(); }
+                    3     => payload = ir.bytes().unwrap().to_vec(),
+                    5     => idx     = ir.varint().unwrap() as i32,
+                    _     => panic!("unexpected field {f}"),
+                }
+            }
+            ws.dispatch_rpc_response(RpcResponse { idx, error: None, payload: Some(b"".as_slice()) });
+
+            let rid = h.await.unwrap().expect("SendMessage should succeed");
+            assert!(rid > prev_rid, "rids must strictly increase: {prev_rid} → {rid}");
+            prev_rid = rid;
+
+            // Wire payload == builder output for the rid reported.
+            assert_eq!(payload, build_send_text_payload(42, 0, rid, "hi"));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_text_message_without_sender_reports_not_connected() {
+        let ws = WsClient::new();
+        let err = ws.send_text_message(42, 0, "hi").await.unwrap_err();
+        assert!(matches!(err, RpcCallError::NotConnected));
     }
 
     // ── Rule-engine table ─────────────────────────────────────
