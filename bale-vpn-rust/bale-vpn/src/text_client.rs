@@ -60,6 +60,12 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::Duration;
+// The stats loop is the one async task here, so its handle is
+// tokio's — which is why it is aliased instead of being the
+// `JoinHandle` above. Only tokio's can be `abort`ed; the reader
+// and writer are OS threads and stop via the stop flag.
+#[cfg(unix)]
+use tokio::task::JoinHandle as TokioJoinHandle;
 
 /// Interface / address for the text-mode client TUN. Same values
 /// the Voice path uses for `--client-tun`, so the host-side route
@@ -391,7 +397,7 @@ struct Session {
     stop:   Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
-    stats:  Option<JoinHandle<()>>,
+    stats:  Option<TokioJoinHandle<()>>,
 }
 
 #[cfg(unix)]
