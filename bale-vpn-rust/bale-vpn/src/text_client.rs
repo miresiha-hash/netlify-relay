@@ -67,17 +67,40 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio::task::JoinHandle as TokioJoinHandle;
 
-/// Interface / address for the text-mode client TUN. Same values
-/// the Voice path uses for `--client-tun`, so the host-side route
-/// recipe is identical whichever carrier is selected.
+/// Default interface / address for the text-mode TUN, matching the
+/// values the Voice path uses for `--client-tun` so the host-side
+/// route recipe is identical whichever carrier is selected.
+///
+/// Both are overridable from the environment because two daemons on
+/// one host — the testbed, or anyone testing two peers against each
+/// other — would otherwise fight over a single interface name. The
+/// second `TUNSETIFF` does not fail here: it attaches to the
+/// *existing* device, so both processes would share one TUN and
+/// quietly steal each other's packets.
 #[cfg(unix)]
-const TUN_NAME: &str = "bale-c0";
+const DEFAULT_TUN_NAME: &str = "bale-c0";
 #[cfg(unix)]
-const TUN_ADDR: &str = "10.8.0.2";
+const DEFAULT_TUN_ADDR: &str = "10.8.0.2";
 #[cfg(unix)]
 const TUN_PREFIX: u8 = 24;
 #[cfg(unix)]
 const TUN_MTU: u16 = 1400;
+
+/// TUN interface name: `BALE_TEXT_TUN_NAME`, else the default.
+#[cfg(unix)]
+fn tun_name() -> String {
+    std::env::var("BALE_TEXT_TUN_NAME")
+        .unwrap_or_else(|_| DEFAULT_TUN_NAME.to_string())
+}
+
+/// TUN address: `BALE_TEXT_TUN_ADDR`, else the default. Left to
+/// `open_client_tun` to parse, so a malformed value surfaces as an
+/// error naming the address rather than a silent fallback.
+#[cfg(unix)]
+fn tun_addr() -> String {
+    std::env::var("BALE_TEXT_TUN_ADDR")
+        .unwrap_or_else(|_| DEFAULT_TUN_ADDR.to_string())
+}
 
 /// How long the TUN threads wait between wake-ups. Bounds both
 /// their idle cost (~50 wake-ups/s) and how long teardown can take
@@ -105,9 +128,13 @@ pub async fn run(
     log::info!("text: peer {peer_uid} — no call; IP packets ride Bale text messages");
     log::info!("text: SOCKS5 is Voice-only; the byte path here is the kernel TUN");
 
-    let dev = crate::tun::open_client_tun(TUN_NAME, TUN_ADDR, TUN_PREFIX, TUN_MTU).map_err(
-        |e| format!("text: kernel TUN open failed ({e}) — Text mode needs CAP_NET_ADMIN"),
-    )?;
+    let tun_name = tun_name();
+    let tun_addr = tun_addr();
+    let dev = crate::tun::open_client_tun(&tun_name, &tun_addr, TUN_PREFIX, TUN_MTU).map_err(|e| {
+        format!(
+            "text: kernel TUN open failed ({tun_name} {tun_addr}: {e}) — Text mode needs CAP_NET_ADMIN"
+        )
+    })?;
     let iface = dev.name.clone();
     let raw: RawFd = dev.into_raw_fd();
     // SAFETY: `open_client_tun` handed us a live descriptor and we
@@ -115,7 +142,7 @@ pub async fn run(
     // behind our back.
     let file = Arc::new(unsafe { File::from_raw_fd(raw) });
     log::info!(
-        "text: TUN {iface} up ({TUN_ADDR}/{TUN_PREFIX}, mtu={TUN_MTU}, fd={raw})"
+        "text: TUN {iface} up ({tun_addr}/{TUN_PREFIX}, mtu={TUN_MTU}, fd={raw})"
     );
 
     let wire: Arc<dyn TextWire> = Arc::new(BaleTextWire {
