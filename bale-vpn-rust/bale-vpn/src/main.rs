@@ -20,6 +20,9 @@ mod daemon;
 mod server;
 // Carrier (transport) selection — voice / text / file / god.
 mod carrier;
+// Byte transport over Bale text messages — the paced, windowed, ACK'd
+// path that carries TUN traffic when WebRTC isn't usable.
+mod text_tunnel;
 // Kernel-TUN device open/configure — Unix-only (uses `std::os::fd::RawFd`
 // + TUNSETIFF/utun ioctls). Windows server/client run userspace NAT and
 // never touch a kernel TUN, so the module isn't compiled there.
