@@ -2828,11 +2828,15 @@ mod tests {
     }
 
     /// End-to-end outbound: two sends against a fake transport.
-    /// First frame is pinned byte for byte (idx=1 on a fresh
-    /// client); both rids must come back, strictly increasing
-    /// even when both sends land in the same millisecond, and the
-    /// payload actually written to the wire must be the one the
-    /// builder produces for the rid we report.
+    /// The first frame is pinned byte for byte *for the rid we
+    /// actually reported* — `next_rid` derives rid from the wall
+    /// clock (the live probe showed Bale accepting timestamp
+    /// rids), so the fixed envelope bytes are pinned separately
+    /// with rid=1 in `send_message_frame_is_byte_exact`. Both
+    /// rids must come back, strictly increasing even when both
+    /// sends land in the same millisecond, and the payload
+    /// actually written to the wire must be the one the builder
+    /// produces for the rid we report.
     #[tokio::test]
     async fn send_text_message_sends_byte_exact_frame_and_returns_rid() {
         let ws = WsClient::new();
@@ -2847,23 +2851,6 @@ mod tests {
             });
 
             let outgoing = rx.recv().await.expect("send_text_message should push a frame");
-
-            if round == 0 {
-                assert_eq!(
-                    outgoing,
-                    vec![
-                        0x0A, 0x40, 0x0A, 0x1B, 0x62, 0x61, 0x6C, 0x65,
-                        0x2E, 0x6D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x69,
-                        0x6E, 0x67, 0x2E, 0x76, 0x32, 0x2E, 0x4D, 0x65,
-                        0x73, 0x73, 0x61, 0x67, 0x69, 0x6E, 0x67, 0x12,
-                        0x0B, 0x53, 0x65, 0x6E, 0x64, 0x4D, 0x65, 0x73,
-                        0x73, 0x61, 0x67, 0x65, 0x1A, 0x12, 0x0A, 0x06,
-                        0x08, 0x01, 0x10, 0x2A, 0x18, 0x00, 0x10, 0x01,
-                        0x1A, 0x06, 0x7A, 0x04, 0x0A, 0x02, 0x68, 0x69,
-                        0x28, 0x01,
-                    ]
-                );
-            }
 
             // Pull idx and payload back out of the frame, then
             // answer it like the server would.
@@ -2887,6 +2874,28 @@ mod tests {
             let rid = h.await.unwrap().expect("SendMessage should succeed");
             assert!(rid > prev_rid, "rids must strictly increase: {prev_rid} → {rid}");
             prev_rid = rid;
+
+            // rid is a millisecond timestamp on the wire (the live
+            // probe sent `now_ms + random`, and Bale correlates
+            // pushes by it) — never a small counter.
+            assert!(rid >= 1_700_000_000_000, "rid must be a ms timestamp, got {rid}");
+
+            if round == 0 {
+                // First RPC on a fresh client: idx pinned to 1,
+                // everything else derived from the reported rid.
+                // The literal envelope bytes for rid=1 live in
+                // `send_message_frame_is_byte_exact`.
+                assert_eq!(
+                    outgoing,
+                    encode_rpc(
+                        MESSAGING_SERVICE,
+                        MESSAGING_SEND,
+                        &build_send_text_payload(42, 0, rid, "hi"),
+                        1,
+                    ),
+                    "first frame must be the pinned envelope carrying uid=42, text=\"hi\" and the rid we returned"
+                );
+            }
 
             // Wire payload == builder output for the rid reported.
             assert_eq!(payload, build_send_text_payload(42, 0, rid, "hi"));
