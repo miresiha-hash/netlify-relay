@@ -630,7 +630,7 @@ fn parse_text_content(raw: &[u8]) -> Option<String> {
             let mut t = ProtoReader::new(inner);
             while t.has_more() {
                 let (tf, tw) = t.tag().ok()?;
-                if tf == 1 && tw == 2 { return t.string().ok(); }
+                if tf == 1 && tw == 2 { return t.string().ok().map(str::to_owned); }
                 t.skip(tw).ok()?;
             }
             return None;
