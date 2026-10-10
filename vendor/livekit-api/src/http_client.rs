@@ -38,7 +38,9 @@ mod tokio {
         reqwest::Client::new()
             .get(url)
             .bearer_auth(token)
-            .user_agent(crate::BROWSER_UA)
+            // NOTE: RequestBuilder has no .user_agent() (that method lives
+            // on ClientBuilder) — set it as a header directly.
+            .header(reqwest::header::USER_AGENT, crate::BROWSER_UA)
             .send()
             .await
     }
