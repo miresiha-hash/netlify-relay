@@ -9,12 +9,56 @@ name: Rust
 on:
   push:
     branches: [main]
+    # Tag pushes ignore path filters by GitHub's rules, so a release
+    # always runs the full check regardless of what changed.
+    paths:
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'bale-vpn-rust/**'
+      - 'bale-vpn-android/rust/**'
+      - 'vendor/**'
+      - '.github/workflows/rust.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'bale-vpn-rust/**'
+      - 'bale-vpn-android/rust/**'
+      - 'vendor/**'
+      - '.github/workflows/rust.yml'
   workflow_dispatch:
 
+# A newer push to the same ref makes older queued/running runs
+# pointless — cancel them instead of burning the free-tier quota
+# on a commit nobody will ship.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Decides the OS matrix. macOS runners bill at 10x and Windows at
+  # 2x against the 2000-min free-tier monthly quota, so the 4-OS
+  # sweep (which only guards macOS/Windows shipping quirks) is
+  # reserved for release tags and manual runs; every push/PR pays
+  # for Linux alone.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.plan.outputs.os }}
+    steps:
+      - id: plan
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo 'os=["ubuntu-latest","macos-latest","macos-26-intel","windows-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
+    needs: plan
     name: cargo test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -24,7 +68,8 @@ jobs:
         # lktunnel's TUN / NAT code — our crate has Unix-only paths that
         # need to stay gated. macos-latest is Apple Silicon (arm64);
         # macos-26-intel covers the x86_64 build that ships in releases.
-        os: [ubuntu-latest, macos-latest, macos-26-intel, windows-latest]
+        # Which of those actually run is decided by the `plan` job.
+        os: ${{ fromJSON(needs.plan.outputs.os) }}
     runs-on: ${{ matrix.os }}
     # Use bash for every `run:` step (the rustup-guard step uses bash
     # syntax) so the workflow is OS-uniform; git-bash is preinstalled on
@@ -120,6 +165,18 @@ jobs:
       - name: cargo build (bale-vpn-rust, headless)
         working-directory: bale-vpn-rust
         run: cargo build -p bale-vpn --release --no-default-features
+
+      # Test it too, not just build it. A build-only gate means
+      # unit tests in this crate (config resolution, carrier
+      # selection, axum handlers) silently never run — green CI
+      # with zero coverage of the crate under change.
+      #
+      # `--no-default-features` matches the build step: this job
+      # doesn't install libsoup-3.0 / webkit2gtk, which the
+      # default `gui` feature drags in via `wry`.
+      - name: cargo test (bale-vpn-rust)
+        working-directory: bale-vpn-rust
+        run: cargo test -p bale-vpn --release --no-default-features
 
       # ── Signaling stack ──────────────────────────────────────
       #

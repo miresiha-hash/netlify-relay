@@ -120,6 +120,10 @@ struct ConfigBody {
     nat_mode:    String,
     peer_id:     Option<String>,
     socks5_port: u16,
+    /// Transport carrier the daemon will actually run
+    /// (`voice` / `text` / `file` / `god`). Never null — a
+    /// config file predating carriers yields `voice`.
+    carrier:     String,
 }
 
 async fn get_config(State(s): State<Arc<AppState>>) -> Json<ConfigBody> {
@@ -129,6 +133,7 @@ async fn get_config(State(s): State<Arc<AppState>>) -> Json<ConfigBody> {
         nat_mode:    cfg.nat_mode.clone(),
         peer_id:     cfg.peer_id.clone(),
         socks5_port: cfg.socks5_port,
+        carrier:     cfg.carrier.as_str().to_string(),
     })
 }
 
@@ -145,6 +150,11 @@ struct SetConfigBody {
     server_peer_id: Option<String>,
     #[serde(default)]
     socks5_port:    Option<u16>,
+    /// Transport carrier. A value outside voice/text/file/god
+    /// is a 400, not a silent default — the UI only ever sends
+    /// the four, so anything else is a bug worth surfacing.
+    #[serde(default)]
+    carrier:        Option<String>,
     // Any other JSON keys the UI sends (`serverPeerType`,
     // `transport`, etc.) are silently dropped by serde —
     // they exist in the Node app's payload shape but the
@@ -169,11 +179,24 @@ async fn set_config(
     let nat_disk     = body.nat_mode.clone();
     let peer_disk    = body.server_peer_id.clone();
     let socks5_disk  = body.socks5_port;
+    let carrier_disk = body.carrier.clone();
+
+    // Validate the carrier *before* touching disk: a bad value
+    // must not be persisted, or the next restart would load it.
+    if let Some(c) = carrier_disk.as_deref() {
+        if crate::carrier::CarrierKind::parse(c).is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "unknown carrier {c:?} — expected voice | text | file | god"
+            )));
+        }
+    }
+
     s.config_file.update(|c| {
         if let Some(m) = mode_disk   { c.mode = Some(m); }
         if let Some(n) = nat_disk    { c.nat_mode = Some(n); }
         if let Some(p) = peer_disk   { c.peer_id = Some(p); }
         if let Some(p) = socks5_disk { c.socks5_port = p; }
+        if let Some(k) = carrier_disk { c.carrier = Some(k); }
     }).map_err(|e| ApiError::Internal(format!("persist: {e}")))?;
 
     // Mirror into the live Resolved so /config GET and other
@@ -202,6 +225,16 @@ async fn set_config(
             cfg.peer_id = Some(p);
         }
         if let Some(p) = body.socks5_port { cfg.socks5_port = p; }
+        // Mirror the carrier. Same restart rule as peer_id: the
+        // client engine is handed its carrier once when
+        // `run_client` spawns, so a live switch has to republish
+        // the mode or the pick is ignored until the next boot.
+        if let Some(k) = body.carrier {
+            if let Some(parsed) = crate::carrier::CarrierKind::parse(&k) {
+                if cfg.carrier != parsed { should_restart = true; }
+                cfg.carrier = parsed;
+            }
+        }
         restart_mode = cfg.mode.clone();
     }
     if should_restart {
@@ -929,17 +962,24 @@ async fn tunnel_client_disconnect(
 #[derive(Serialize)]
 struct OkBody { ok: bool }
 
-/// Tiny error wrapper. Returns **200 + `{ok:false, error:..}`**
-/// so the embedded HTML/JS UI (which checks `data.ok`, not the
+/// Tiny error wrapper. Returns **200 + `{ok:false, error:..}`** so
+/// the embedded HTML/JS UI (which checks `data.ok`, not the
 /// HTTP status) can surface the message. Matches the Node app's
 /// response shape — calling code stays branch-free.
 #[derive(Debug)]
 enum ApiError {
+    /// Caller sent a bad value (unknown carrier, …). Same 200
+    /// envelope as `Internal` — the UI branches on `ok`, not on
+    /// the status, so distinguishing it costs nothing but keeps
+    /// the `expect` messages honest.
+    BadRequest(String),
     Internal(String),
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let Self::Internal(m) = self;
+        let m = match self {
+            Self::BadRequest(m) | Self::Internal(m) => m,
+        };
         // 200 OK; failure flag lives in the body. The 500 path
         // was a footgun — tower-http logs every failed call as
         // an alarming server error, and the UI never gets to

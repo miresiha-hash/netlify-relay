@@ -243,6 +243,21 @@
           <label>SOCKS5 port</label>
           <input id="socks5Port" type="number" value="1080" min="1" max="65535">
         </div>
+        <div>
+          <!-- Carrier picker. voice = the shipped WebRTC call
+               path; text/file = the chunked-message and Files
+               carriers (protocol-proven, Rust wiring lands with
+               them); god = automatic across all three. Sending an
+               unknown string gets a 400 from /tunnel/config,
+               never a silent default. -->
+          <label>Transport</label>
+          <select id="carrier">
+            <option value="voice">Voice (WebRTC)</option>
+            <option value="text">Text (messages)</option>
+            <option value="file">File (Files)</option>
+            <option value="god">God (auto)</option>
+          </select>
+        </div>
       </div>
       <div>
         <label>Find peer by phone number</label>
@@ -411,6 +426,7 @@ function saveConfig() {
   localStorage.setItem('bale_cfg', JSON.stringify({
     peer:      document.getElementById('tunnelPeer').value,
     port:      document.getElementById('socks5Port').value,
+    carrier:   document.getElementById('carrier').value || 'voice',
   }));
 }
 
@@ -418,6 +434,7 @@ function loadConfig() {
   let cfg;
   try { cfg = JSON.parse(localStorage.getItem('bale_cfg') || '{}'); } catch { cfg = {}; }
   if (cfg.port) document.getElementById('socks5Port').value = cfg.port;
+  if (cfg.carrier) document.getElementById('carrier').value = cfg.carrier;
   return cfg;
 }
 
@@ -858,7 +875,15 @@ async function activateTunnel() {
       const r = await fetch('/tunnel/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ socks5Port: port, serverPeerId: peerId, serverPeerType: peerType }),
+        body: JSON.stringify({
+          socks5Port: port,
+          serverPeerId: peerId,
+          serverPeerType: peerType,
+          // Transport carrier for this session. Persists via
+          // /tunnel/config; the daemon logs it on every connect
+          // as `carrier: requested=… effective=…`.
+          carrier: document.getElementById('carrier').value || 'voice',
+        }),
       });
       d = await r.json();
       saveConfig();

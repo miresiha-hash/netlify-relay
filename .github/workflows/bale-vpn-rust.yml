@@ -19,31 +19,71 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Tag pushes ignore path filters by GitHub's rules, so a release
+    # always builds every OS regardless of what changed.
+    paths:
+      - 'bale-vpn-rust/**'
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'vendor/**'
+      - '.github/workflows/bale-vpn-rust.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'bale-vpn-rust/**'
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'vendor/**'
+      - '.github/workflows/bale-vpn-rust.yml'
   workflow_dispatch:
 
 permissions:
   contents: write   # needed for softprops/action-gh-release on tags
 
+# Cancel superseded runs on the same ref (free-tier quota is
+# 2000 min/month and macOS runners bill at 10x).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Decides the OS matrix: macOS (10x billing) and Windows (2x)
+  # only build for release tags / manual runs. What ships from a
+  # plain push or PR is the Linux binary — same source, and the
+  # macOS/Windows quirks never regress silently because the tag
+  # build still covers them.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+    steps:
+      - id: plan
+        run: |
+          linux='{"os":"ubuntu-22.04","artifact_os":"linux-x86_64","bin_ext":""}'
+          mac_arm='{"os":"macos-latest","artifact_os":"macos-aarch64","bin_ext":""}'
+          mac_intel='{"os":"macos-26-intel","artifact_os":"macos-x86_64","bin_ext":""}'
+          win='{"os":"windows-latest","artifact_os":"windows-x86_64","bin_ext":".exe"}'
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "include=[$linux,$mac_arm,$mac_intel,$win]" >> "$GITHUB_OUTPUT"
+          else
+            echo "include=[$linux]" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: plan
     name: build (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        include:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
           # ubuntu-22.04 (glibc 2.35), NOT ubuntu-latest: the deploy
           # target (Pouya's VPS) runs Ubuntu 22.04, and a binary built
           # on ubuntu-latest (24.04, glibc 2.39) refuses to load there
           # ("GLIBC_2.39 not found"). Build against the OLDEST glibc we
           # care about; newer distros load it fine.
-          - os:           ubuntu-22.04
-            artifact_os:  linux-x86_64
-            bin_ext:      ''
-          - os:           macos-latest
-            artifact_os:  macos-aarch64
-            bin_ext:      ''
+          #
           # macos-latest is Apple Silicon (arm64). macos-26-intel is the
           # Intel (x86_64) runner — build natively there so the release
           # ships a macOS Intel binary too (the webrtc-rs stack is pure
@@ -55,12 +95,6 @@ jobs:
           # runner — was replaced by bale-vpn-rust.yml. Last shipped in
           # v1.3.2. Runner label matches ab6397f "Use a new OSX 64x builder"
           # (the project moved off macos-13 deliberately).
-          - os:           macos-26-intel
-            artifact_os:  macos-x86_64
-            bin_ext:      ''
-          - os:           windows-latest
-            artifact_os:  windows-x86_64
-            bin_ext:      '.exe'
     runs-on: ${{ matrix.os }}
     defaults:
       run:

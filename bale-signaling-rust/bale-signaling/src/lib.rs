@@ -12,3 +12,4 @@ pub mod signaling;
 pub use auth::{AuthError, AuthOutcome, BaleAuth, StartResult};
 pub use peer::BalePeer;
 pub use signaling::BaleSignaling;
+pub use ws::{TextMessage, TextMessageCb};

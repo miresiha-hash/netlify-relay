@@ -577,10 +577,30 @@ async fn run_client(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
     // Drop already deactivated. The ClientTunnelManager
     // constructed below activates with client semantics.
 
-    let (peer_id_str, socks5_port, client_tun) = {
+    // ── Carrier selection ───────────────────────────────────────
+    // The user's pick arrives as a CarrierKind in Resolved.
+    // Only Voice is wired to a transport today (the LiveKit
+    // engine below); Text/File/God resolve through
+    // `effective()` to Voice, so the selector is live now and
+    // the transports fill in behind it without a second round
+    // of plumbing. When Text/File land, the block here becomes
+    // the branch that dials *their* transport instead of
+    // `LkTunnel::connect`.
+    let (carrier, peer_id_str, socks5_port, client_tun) = {
         let cfg = state.cfg.read().await;
-        (cfg.peer_id.clone(), cfg.socks5_port, cfg.client_tun)
+        (cfg.carrier, cfg.peer_id.clone(), cfg.socks5_port, cfg.client_tun)
     };
+    let effective = carrier.effective();
+    if !carrier.is_available() {
+        log::warn!(
+            "carrier={}: selected but not yet implemented — running {} instead",
+            carrier.as_str(),
+            effective.as_str()
+        );
+    }
+    log::info!("carrier: requested={} effective={}",
+        carrier.as_str(), effective.as_str());
+
     let Some(peer_id_str) = peer_id_str else {
         log::info!("client: no peer_id configured — waiting for selection via HTTP UI");
         std::future::pending::<()>().await;
