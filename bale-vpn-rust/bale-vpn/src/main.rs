@@ -18,6 +18,8 @@ mod client;
 mod config;
 mod daemon;
 mod server;
+// Carrier (transport) selection — voice / text / file / god.
+mod carrier;
 // Kernel-TUN device open/configure — Unix-only (uses `std::os::fd::RawFd`
 // + TUNSETIFF/utun ioctls). Windows server/client run userspace NAT and
 // never touch a kernel TUN, so the module isn't compiled there.
@@ -50,6 +52,13 @@ struct Cli {
     /// Config directory. Defaults to the directory of the binary.
     #[arg(long)]
     config_dir: Option<PathBuf>,
+
+    /// Transport carrier for client mode. `voice` = the LiveKit
+    /// WebRTC path (default, the shipped product); `text` /
+    /// `file` = alternate Bale-native carriers; `god` = automatic
+    /// selection across all of them. Overrides the config file.
+    #[arg(long)]
+    carrier: Option<String>,
 
     /// Mode + its mode-specific args. Optional — without it the
     /// daemon starts with mode unset and waits for the UI picker.
@@ -122,11 +131,25 @@ fn main() {
         None => (None, None, false),
     };
 
-    log::info!("bale-vpn starting (port={} mode={} nat={} headless={})",
+    log::info!("bale-vpn starting (port={} mode={} nat={} carrier={} headless={})",
         cli.port,
         cli_mode.clone().unwrap_or_else(|| "unset".into()),
         cli_nat .clone().unwrap_or_else(|| "default".into()),
+        cli.carrier.clone().unwrap_or_else(|| "default".into()),
         cli.headless);
+
+    // Reject a bad --carrier at the boundary with a clear
+    // message rather than letting merge_cli silently log-and-
+    // fall-back. The CLI is the operator's explicit intent; a
+    // typo there deserves an error, not a surprise default.
+    if let Some(c) = cli.carrier.as_deref() {
+        if carrier::CarrierKind::parse(c).is_none() {
+            eprintln!(
+                "error: unknown carrier {c:?} — expected voice | text | file | god"
+            );
+            std::process::exit(2);
+        }
+    }
 
     let cfg = config::Config::load(cli.config_dir.as_deref())
         .expect("failed to load config");
@@ -137,6 +160,7 @@ fn main() {
         cli.port,
         client_tun,
         cli.config_dir.clone(),
+        cli.carrier,
     );
 
     // GUI vs headless dispatch:

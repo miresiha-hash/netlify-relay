@@ -77,6 +77,12 @@ pub struct Config {
     /// Client-mode SOCKS5 listen port.
     #[serde(default = "default_socks5_port", rename = "socks5Port")]
     pub socks5_port: u16,
+
+    /// Transport carrier: `"voice"` / `"text"` / `"file"` / `"god"`.
+    /// Missing key (pre-carrier config files) → Voice, which is
+    /// the carrier every existing install was already using.
+    #[serde(default)]
+    pub carrier: Option<String>,
 }
 
 fn default_port()        -> u16    { 3001 }
@@ -130,6 +136,14 @@ pub struct Resolved {
     pub port:        u16,
     pub peer_id:     Option<String>,
     pub socks5_port: u16,
+    /// Transport carrier, always resolved to a concrete
+    /// [`CarrierKind`] (never `None`) — a config file from
+    /// before carriers existed simply yields Voice. A value
+    /// that doesn't parse is downgraded to Voice with a warning
+    /// (`merge_cli`), while `--carrier` on the CLI is rejected
+    /// outright by `main` — an explicit operator intent typo
+    /// deserves an error, a stale config file doesn't.
+    pub carrier:     crate::carrier::CarrierKind,
     /// Client-mode only: open a local TUN device alongside
     /// SOCKS5. Driven by the `--client-tun` CLI flag.
     pub client_tun:  bool,
@@ -151,6 +165,7 @@ impl Resolved {
         cli_port:        u16,
         client_tun:      bool,
         cli_config_dir:  Option<PathBuf>,
+        cli_carrier:     Option<String>,
     ) -> Self {
         // CLI > config file > unset (UI picker).
         let mode_pinned_by_cli = cli_mode.is_some();
@@ -160,6 +175,22 @@ impl Resolved {
         let nat_mode = cli_nat
             .or_else(|| cfg.nat_mode.clone())
             .unwrap_or_else(|| "userspace".to_string());
+        // Carrier: CLI flag wins, then the config file, then the
+        // pre-carrier default (Voice). An unparseable value logs
+        // and falls back to Voice — refusing to boot over a typo
+        // in a config key would be worse than running the
+        // carrier the user already had.
+        let carrier_raw = cli_carrier.or_else(|| cfg.carrier.clone());
+        let carrier = match carrier_raw.as_deref() {
+            None => crate::carrier::CarrierKind::Voice,
+            Some(s) => match crate::carrier::CarrierKind::parse(s) {
+                Some(k) => k,
+                None    => {
+                    log::warn!("config: unknown carrier {s:?} — falling back to voice");
+                    crate::carrier::CarrierKind::Voice
+                }
+            },
+        };
         // `--config-dir` must drive BOTH the initial load and the
         // long-lived ConfigFile handle — otherwise a daemon started
         // with the flag loads its config from one directory and
@@ -173,6 +204,7 @@ impl Resolved {
             port: cli_port,
             peer_id: cfg.peer_id.clone(),
             socks5_port: cfg.socks5_port,
+            carrier,
             client_tun,
             mode_pinned_by_cli,
             config_dir,
@@ -322,5 +354,107 @@ impl TokenStore for FileTokenStore {
         if let Err(e) = self.file.update(|c| c.token.clear()) {
             log::warn!("token clear: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::carrier::CarrierKind;
+
+    /// Build a `Config` without touching disk — `merge_cli` is
+    /// pure (it only *reads* the file handle's snapshot), so no
+    /// config dir or IO is involved.
+    fn cfg_with_carrier(v: Option<&str>) -> Config {
+        Config {
+            carrier: v.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    fn resolve(cfg: &Config, cli_carrier: Option<&str>) -> CarrierKind {
+        Resolved::merge_cli(
+            cfg,
+            None,   // cli_mode
+            None,   // cli_nat
+            3001,   // cli_port
+            false,  // client_tun
+            None,   // cli_config_dir
+            cli_carrier.map(str::to_string),
+        ).carrier
+    }
+
+    #[test]
+    fn carrier_defaults_to_voice_when_absent() {
+        // A config file written before carriers existed has no
+        // "carrier" key. It must resolve to Voice — the carrier
+        // that install was already running — not panic and not
+        // land on some other transport.
+        assert_eq!(resolve(&cfg_with_carrier(None), None), CarrierKind::Voice);
+    }
+
+    #[test]
+    fn carrier_from_config_file_is_honoured() {
+        assert_eq!(
+            resolve(&cfg_with_carrier(Some("text")), None),
+            CarrierKind::Text
+        );
+        assert_eq!(
+            resolve(&cfg_with_carrier(Some("god")),  None),
+            CarrierKind::God
+        );
+    }
+
+    #[test]
+    fn cli_flag_overrides_config_file() {
+        // CLI is the operator's explicit intent; it wins over
+        // whatever the file says.
+        assert_eq!(
+            resolve(&cfg_with_carrier(Some("text")), Some("file")),
+            CarrierKind::File
+        );
+    }
+
+    #[test]
+    fn unknown_config_value_degrades_to_voice() {
+        // A corrupted/typo'd value in the file must not brick
+        // the daemon — it falls back to Voice with a warning so
+        // the session still comes up.
+        assert_eq!(
+            resolve(&cfg_with_carrier(Some("teleport")), None),
+            CarrierKind::Voice
+        );
+    }
+
+    #[test]
+    fn config_file_deserializes_without_carrier_key() {
+        // Byte-for-byte shape of a pre-carrier config on disk.
+        let json = r#"{"token":"x","mode":"client","peerId":"42"}"#;
+        let cfg: Config = serde_json::from_str(json).expect("old config parses");
+        assert_eq!(cfg.carrier, None);
+        assert_eq!(cfg.socks5_port, 1080);
+        assert_eq!(cfg.peer_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn config_file_round_trips_carrier() {
+        let mut cfg = Config::default();
+        cfg.carrier = Some("file".into());
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"carrier\":\"file\""), "got {json}");
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.carrier.as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn resolved_carrier_survives_default_config() {
+        // The end-to-end path: default Config (no carrier key)
+        // → Resolved → still Voice, which is what run_client
+        // hands to the engine.
+        let r = Resolved::merge_cli(
+            &Config::default(), None, None, 3001, false, None, None,
+        );
+        assert_eq!(r.carrier, CarrierKind::Voice);
+        assert!(r.carrier.is_available());
     }
 }
