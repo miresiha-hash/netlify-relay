@@ -166,6 +166,18 @@ jobs:
         working-directory: bale-vpn-rust
         run: cargo build -p bale-vpn --release --no-default-features
 
+      # Test it too, not just build it. A build-only gate means
+      # unit tests in this crate (config resolution, carrier
+      # selection, axum handlers) silently never run — green CI
+      # with zero coverage of the crate under change.
+      #
+      # `--no-default-features` matches the build step: this job
+      # doesn't install libsoup-3.0 / webkit2gtk, which the
+      # default `gui` feature drags in via `wry`.
+      - name: cargo test (bale-vpn-rust)
+        working-directory: bale-vpn-rust
+        run: cargo test -p bale-vpn --release --no-default-features
+
       # ── Signaling stack ──────────────────────────────────────
       #
       # `lk-signaling-rust/` is the generic trait crate; cheap
