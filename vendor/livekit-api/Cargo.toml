@@ -216,9 +216,11 @@ default-features = false
 [dependencies.tokio-tungstenite]
 version = "0.29"
 # Note: tokio-tungstenite/tungstenite carry no deflate feature (upstream
-# dropped compression). The permessage-deflate offer every real browser
-# sends is therefore emitted manually as a request header — see
-# signal_stream.rs. Features otherwise match the published crate.
+# never shipped permessage-deflate). We must therefore NOT offer
+# sec-websocket-extensions at all: Bale's server accepts the offer and
+# then sends RSV1 frames the codec cannot decode (live-verified
+# 2026-10-10). See signal_stream.rs. Features otherwise match the
+# published crate.
 features = ["url"]
 optional = true
 
