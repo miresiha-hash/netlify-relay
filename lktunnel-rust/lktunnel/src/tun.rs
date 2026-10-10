@@ -327,7 +327,11 @@ fn tun_write(fd: i32, buf: &[u8]) -> io::Result<usize> {
 /// Build the on-wire bytes for `format` from a raw IP packet.
 /// Returns a fresh `Vec` for both formats; the bridge pushes this
 /// straight into `pending`.
-fn wrap_for_wire(ip: &[u8], format: TunFormat) -> Vec<u8> {
+///
+/// Public because any component that talks to a kernel TUN has to
+/// frame the same way — `bale-vpn`'s text carrier writes this
+/// directly instead of keeping a second copy of the layout.
+pub fn wrap_for_wire(ip: &[u8], format: TunFormat) -> Vec<u8> {
     match format {
         TunFormat::RawIp => ip.to_vec(),
         TunFormat::UtunAfHeader => {
@@ -341,8 +345,12 @@ fn wrap_for_wire(ip: &[u8], format: TunFormat) -> Vec<u8> {
 }
 
 /// Unwrap on-wire bytes into the raw IP slice. Borrows from the
-/// input — no copy.
-fn unwrap_from_wire(wire: &[u8], format: TunFormat) -> &[u8] {
+/// input — no copy. Returns an empty slice for a frame too short
+/// to contain a packet, so callers can treat that as a drop.
+///
+/// Public for the same reason as [`wrap_for_wire`]: one definition
+/// of where the `utun` AF prefix ends.
+pub fn unwrap_from_wire(wire: &[u8], format: TunFormat) -> &[u8] {
     match format {
         TunFormat::RawIp => wire,
         TunFormat::UtunAfHeader => {

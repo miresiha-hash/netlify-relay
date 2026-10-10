@@ -6,11 +6,11 @@
 //!
 //!   - [`CarrierKind::Voice`] — the LiveKit WebRTC / Opus path
 //!     (`lktunnel`'s `Engine`). This is the original product and
-//!     the only carrier wired up end-to-end today.
+//!     still the carrier that carries calls and SOCKS5.
 //!   - [`CarrierKind::Text`]  — chunked tunnel frames over Bale
-//!     text messages. Protocol surface proven (4096-char cap,
-//!     SendMessage + textMessage cb); the Rust transport is the
-//!     next piece to land.
+//!     text messages. **Implemented**: [`crate::text_client`]
+//!     moves real IP packets over `send_text_message` with no
+//!     call, no ReliabilitySocket and no LiveKit dependency.
 //!   - [`CarrierKind::File`]  — the Files service (upload /
 //!     download, HTTP Range). Protocol surface proven; bulk
 //!     path (≈0.74 MB/s up, ≈9.5 MB/s down on the VPS).
@@ -70,13 +70,22 @@ impl CarrierKind {
 
     /// The carrier to actually run when this one is selected.
     ///
-    /// Voice is fully wired; the rest are protocol-proven but not
-    /// yet implemented in the Rust client, so they resolve to
-    /// Voice for now. When Text/File land this stops being a
-    /// constant and becomes the God policy: SFU reachable →
-    /// Voice, SFU blocked → Text for control + File for bulk.
+    /// * `Text` → `Text`: **a real transport.** IP packets ride
+    ///   Bale text messages end-to-end ([`crate::text_client`]),
+    ///   with no call and no ReliabilitySocket. This is the one
+    ///   mode that survives the SFU being unreachable.
+    /// * `File` → `Voice`: the Files service is proven at the
+    ///   protocol level but has no byte path in this client yet.
+    /// * `God` → `Voice`: the cluster engine owns this policy;
+    ///   until it speaks, God behaves like Voice.
+    ///
+    /// `is_available()` reads this, so selecting Text stops
+    /// logging a fallback and starts a Text session instead.
     pub fn effective(self) -> CarrierKind {
-        CarrierKind::Voice
+        match self {
+            CarrierKind::Text => CarrierKind::Text,
+            CarrierKind::Voice | CarrierKind::File | CarrierKind::God => CarrierKind::Voice,
+        }
     }
 
     /// True when the user's pick runs as-is (no fallback).
@@ -130,12 +139,18 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_carriers_fall_back_to_voice() {
-        assert_eq!(CarrierKind::Text.effective(), CarrierKind::Voice);
+    fn text_is_live_and_the_rest_still_fall_back_to_voice() {
+        // Text has a byte path now — it must NOT be normalised
+        // away to Voice, or the user's pick silently vanishes.
+        assert_eq!(CarrierKind::Text.effective(), CarrierKind::Text);
+        assert!(CarrierKind::Text.is_available());
+        // Still-unimplemented carriers degrade loudly to Voice.
         assert_eq!(CarrierKind::File.effective(), CarrierKind::Voice);
         assert_eq!(CarrierKind::God.effective(),  CarrierKind::Voice);
+        assert!(!CarrierKind::File.is_available());
+        assert!(!CarrierKind::God.is_available());
+        assert_eq!(CarrierKind::Voice.effective(), CarrierKind::Voice);
         assert!(CarrierKind::Voice.is_available());
-        assert!(!CarrierKind::Text.is_available());
     }
 
     #[test]
