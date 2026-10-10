@@ -4,12 +4,34 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    # Tag pushes ignore path filters by GitHub's rules, so a release
+    # APK is always built. A plain push/PR only pays for the build
+    # when the Rust sources or the Android app actually changed.
+    paths:
+      - 'bale-vpn-android/**'
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'vendor/**'
+      - '.github/workflows/android.yml'
   pull_request:
     branches: [main]
+    paths:
+      - 'bale-vpn-android/**'
+      - 'lktunnel-rust/**'
+      - 'lk-signaling-rust/**'
+      - 'bale-signaling-rust/**'
+      - 'vendor/**'
+      - '.github/workflows/android.yml'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
