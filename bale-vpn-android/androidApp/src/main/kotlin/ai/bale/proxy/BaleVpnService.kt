@@ -26,6 +26,10 @@ class BaleVpnService : VpnService() {
     /** The LiveKit data-channel transport. Present once
      *  startVpn has begun setup. */
     private var transport: LkTunnel?            = null
+    /** The text-carrier session (IP-over-Bale-text). Mutually exclusive
+     *  with [transport]: exactly one of the two exists per connection,
+     *  selected by the `carrier` pref in MainActivity. */
+    private var textTransport: TextTunnel?      = null
     /** Per-session subscriber on [ClientTunnelManager.events]. */
     private var sessionsJob: Job?                = null
     private var wakeLock:  PowerManager.WakeLock? = null
@@ -102,12 +106,23 @@ class BaleVpnService : VpnService() {
             return svc.attachTunNow(t)
         }
 
-        /** Drop the TUN at runtime: the LK tunnel + SOCKS5 listener
-         *  (if up) stay running, but the device's own traffic stops
-         *  routing through the tunnel. Idempotent. */
+        /** Drop the TUN at runtime. Idempotent.
+         *
+         *  LK carrier: the tunnel + SOCKS5 listener (if up) stay running,
+         *  but the device's own traffic stops routing through it.
+         *
+         *  Text carrier: there is no hot-detach — `textcarrier::session`
+         *  owns its TUN fd for its whole life — so closing the session IS
+         *  the detach. The service's 1 Hz liveness poller then sees the
+         *  handle go dead and reports the drop through the same surface as
+         *  any other disconnect. (Keeping the session alive while the UI
+         *  says "VPN off" would be a lie about what the phone is doing.) */
         @JvmStatic
         fun disableTun() {
             liveTransport?.detachTun()
+            instance?.let { svc ->
+                svc.textTransport?.let { it.close(); svc.textTransport = null }
+            }
         }
 
         /** Currently-bound SOCKS5 port (0 = not running). Surfaced so the
@@ -154,6 +169,22 @@ class BaleVpnService : VpnService() {
      *  context; if not, `establish()` returns null and we surface
      *  false so MainActivity can re-prompt. */
     private fun attachTunNow(transport: LkTunnel): Boolean {
+        val fd = establishTun() ?: return false
+        transport.attachTun(fd.detachFd())
+        tunFd = null
+        return true
+    }
+
+    /** Build + establish the client TUN. Returns the live descriptor, or
+     *  null when the VPN permission isn't granted (or establish failed).
+     *  The caller owns the result and must `detachFd()` when handing the
+     *  raw fd to native; until then it is tracked in [tunFd] so
+     *  `stopVpn()` can close a TUN that never reached a tunnel.
+     *
+     *  Shared by all three bring-up paths (runtime `enableTun()`, the
+     *  original LK start, and the text carrier) so the address / route /
+     *  MTU set lives in exactly one place. */
+    private fun establishTun(): ParcelFileDescriptor? {
         val builder = Builder()
             .setSession("Bale VPN")
             .addAddress("10.8.0.2", 24)
@@ -164,12 +195,12 @@ class BaleVpnService : VpnService() {
             .addDisallowedApplication(packageName)
         for ((addr, prefix) in PUBLIC_IPV4_ROUTES) builder.addRoute(addr, prefix)
         val fd = builder.establish() ?: run {
-            Log.e(TAG, "VPN: runtime TUN establish failed (permission not granted?)")
-            return false
+            Log.e(TAG, "VPN: TUN establish failed (permission not granted?)")
+            return null
         }
-        Log.d(TAG, "VPN: runtime TUN up (10.8.0.2/24)")
-        transport.attachTun(fd.detachFd())
-        return true
+        tunFd = fd
+        Log.d(TAG, "VPN: TUN up (10.8.0.2/24)")
+        return fd
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -237,6 +268,98 @@ class BaleVpnService : VpnService() {
         return sig.isConnected
     }
 
+    /** Text-carrier bring-up: IP packets ride as Bale *text* messages on
+     *  the already-open WebSocket — no LiveKit call, no QUIC, no media.
+     *  This is the path for when the LK / QUIC route is unreachable.
+     *
+     *  Deliberate differences from the LK path:
+     *
+     *  * no `placeCall` / no QUIC handshake — the transport *is* the WS,
+     *    so bring-up is "ensure WS, open session, attach TUN";
+     *  * **refuses to run without the TUN**. The LK path happily parks in
+     *    tunnel-only mode (VPN off, SOCKS on); the text carrier has no
+     *    SOCKS5 listener, so with no TUN nothing could reach it and the
+     *    user would see a "connected" service carrying nothing. A visible
+     *    refusal beats a silent no-op — see the alert below;
+     *  * the carrier is fixed for the whole connection: switching means
+     *    Stop then Start (the `carrier` pref is read once, in startVpn).
+     *
+     *  Parks exactly like `startVpn`, so the same `finally` teardown, the
+     *  same foreground notification and the same wake-lock lifecycle
+     *  apply unchanged. */
+    private suspend fun startTextVpn(peerId: String) {
+        try {
+            Log.d(TAG, "VPN(text): starting → $peerId")
+
+            val sig = BaleConnection.signaling ?: run {
+                Log.e(TAG, "VPN(text): BaleSignaling not initialised"); return
+            }
+            // The WS is the carrier: without it there is no transport to
+            // fall back to (that is the entire point of this path).
+            if (!ensureWsUp()) {
+                Log.e(TAG, "VPN(text): WS not up — nothing to carry text frames on"); return
+            }
+
+            val cfg = getSharedPreferences("config", MODE_PRIVATE)
+            if (!cfg.getBoolean("vpn_enabled", true)) {
+                Log.w(TAG, "VPN(text): refused — vpn_enabled=false (no TUN, no SOCKS fallback)")
+                showAlert(
+                    "Bale VPN — text carrier",
+                    "Turn the VPN switch on first: the text carrier has no SOCKS5 fallback, so it needs the TUN."
+                )
+                return
+            }
+
+            // TUN before session: it is the packet source, and packets
+            // written while the session handshakes just sit in the fd
+            // buffer until its reader starts — nothing is dropped.
+            val fd = establishTun() ?: run {
+                Log.e(TAG, "VPN(text): TUN establish failed"); return
+            }
+
+            // `fd.fd` hands over the number WITHOUT transferring
+            // ownership, so a native refusal below still leaves the
+            // descriptor ours to close.
+            val session = TextTunnel.open(sig.handle, peerId, fd.fd)
+            if (session == null) {
+                Log.e(TAG, "VPN(text): native session refused")
+                showAlert(
+                    "Bale VPN — text carrier",
+                    "Could not start the text session — check logcat."
+                )
+                fd.close(); tunFd = null
+                return
+            }
+            // Ownership moves to native now; stopVpn must not touch it.
+            fd.detachFd(); tunFd = null
+
+            textTransport = session
+            isConnected = true
+            Log.d(TAG, "VPN(text): connected ✓ — TUN attached, session live")
+
+            // Watch for the session dying underneath us (hello timeout,
+            // sink-slot conflict, reader/writer failure). The WS staying
+            // up is NOT a liveness signal here — `session::run` parks on
+            // its own future — so poll the handle instead.
+            while (scope.isActive) {
+                delay(1_000)
+                if (!session.isConnected) {
+                    Log.w(TAG, "VPN(text): session ended")
+                    onPermanentDisconnect(rejected = false)
+                    return
+                }
+            }
+        } catch (e: CancellationException) {
+            Log.d(TAG, "VPN(text): startTextVpn cancelled (${e.message})")
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "startTextVpn: exception: ${e::class.simpleName}: ${e.message}", e)
+        } finally {
+            Log.d(TAG, "startTextVpn: finally — calling stopVpn (isRunning=$isRunning)")
+            stopVpn()
+        }
+    }
+
     /** VPN bring-up. Places the call via `signaling.placeCall(peerId)`,
      *  hands the resulting LK creds to the transport, and parks until
      *  cancelled. The permanent-disconnect surface is `LkTunnel`'s
@@ -244,6 +367,15 @@ class BaleVpnService : VpnService() {
      *  intentionally ignored so transient WS errors can't drop the
      *  live call. */
     private suspend fun startVpn(peerId: String) {
+        // Carrier is chosen up-front and held for the whole connection —
+        // see startTextVpn for why it cannot hot-switch.
+        val carrier = getSharedPreferences("config", MODE_PRIVATE)
+            .getString("carrier", "call") ?: "call"
+        if (carrier == "text") {
+            startTextVpn(peerId)
+            return
+        }
+
         try {
             Log.d(TAG, "VPN: starting dial → $peerId")
 
@@ -556,6 +688,12 @@ class BaleVpnService : VpnService() {
         // its `current` slot, and emits SessionEvent.Disconnected.
         transport?.disconnect(); transport = null
         liveTransport = null
+        // Text carrier: releasing the last handle aborts the session
+        // future, whose destructor closes the TUN File it owns, joins the
+        // reader thread and frees the sink slot — one release path, exactly
+        // like LkTunnel's. The fd was detached on the way in, so nothing on
+        // the Kotlin side may close it: this call is the only teardown.
+        textTransport?.close(); textTransport = null
         tunFd?.close(); tunFd = null
         // SOCKS5 listener was aborted by transport.disconnect
         // (via the native socks5_handle drop). Reset the UI-

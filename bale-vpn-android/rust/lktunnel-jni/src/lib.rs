@@ -1,8 +1,9 @@
 //! Merged JNI shim — see `Cargo.toml` for the rationale.
 //!
-//! The actual JNI symbols live in the two sibling modules:
+//! The actual JNI symbols live in the sibling modules:
 //!   * [`tunnel`]     — `LkTunnelNative` / `NativeJni`
 //!   * [`signaling`]  — `BaleSignalingNative` / `BaleAuthNative`
+//!   * [`text`]       — `TextTunnelNative` (text carrier)
 //!
 //! This file owns only the unified `JNI_OnLoad` (one per `.so`)
 //! and the two `pub(crate)` init helpers that wire up
@@ -15,6 +16,7 @@ use std::os::raw::c_void;
 pub mod tunnel;
 pub mod manager;
 pub mod signaling;
+pub mod text;
 
 /// Android linker entry point. Fires once when the app calls
 /// `System.loadLibrary("lktunnel_jni")`. Idempotent across reloads
