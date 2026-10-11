@@ -1,0 +1,30 @@
+[package]
+name        = "textcarrier"
+version     = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Byte transport carried over Bale text messages — pacer, frame codec, retransmit/ACK state machine."
+
+[lib]
+name = "textcarrier"
+path = "src/lib.rs"
+
+[dependencies]
+# `sync` for the mpsc/Notify plumbing, `time` for the pacer's clock
+# and the stall timer. `macros` + `rt` are not optional either: the
+# sender loop is built on `tokio::select!` and `tokio::spawn`, and a
+# lib that spawns needs the runtime feature named explicitly — inside
+# `bale-vpn` those features arrived through the binary's own tokio.
+tokio        = { version = "1", features = ["sync", "time", "macros", "rt"] }
+parking_lot  = "0.12"
+# Payloads ride base64 over the text path: Bale rejects a binary
+# `Content` (member 3 of the union is a message field, not bytes).
+base64       = "0.22"
+async-trait  = "0.1"
+# The sender loop logs rate-limit backoffs and retransmits through the
+# facade, so callers plug in whatever logger they already run.
+log          = "0.4"
+
+[dev-dependencies]
+# The tunnel tests drive real tokio tasks with timers.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
