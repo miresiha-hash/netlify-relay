@@ -51,7 +51,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 #[cfg(unix)]
@@ -169,7 +169,7 @@ pub async fn run(
     let tunnel_r = tunnel.clone();
     let reader = std::thread::Builder::new()
         .name("text-tun-reader".into())
-        .spawn(move || reader_loop(&*file_r, &*tunnel_r, &stop_r))
+        .spawn(move || reader_loop(&*file_r, &*tunnel_r, &stop_r, None))
         .map_err(|e| format!("text: spawn TUN reader failed: {e}"))?;
 
     // Inbound (tunnel → TUN). The `IpSink` callback is sync and
@@ -188,7 +188,7 @@ pub async fn run(
     let file_w = file.clone();
     let writer = std::thread::Builder::new()
         .name("text-tun-writer".into())
-        .spawn(move || writer_loop(&*file_w, pkt_rx, &stop_w))
+        .spawn(move || writer_loop(&*file_w, pkt_rx, &stop_w, None))
         .map_err(|e| format!("text: spawn TUN writer failed: {e}"))?;
 
     // Heartbeat so the log shows whether bytes are actually moving
@@ -235,9 +235,16 @@ pub async fn run(
 /// `Signaling` trait) and it resolves `PeerId` to a uid itself, so
 /// no extra conversion happens here.
 #[cfg(unix)]
-struct BaleTextWire {
+pub(crate) struct BaleTextWire {
     signaling: Arc<BaleSignaling>,
     peer:      PeerId,
+}
+
+#[cfg(unix)]
+impl BaleTextWire {
+    pub(crate) fn new(signaling: Arc<BaleSignaling>, peer: PeerId) -> Self {
+        Self { signaling, peer }
+    }
 }
 
 #[cfg(unix)]
@@ -249,7 +256,22 @@ impl TextWire for BaleTextWire {
             // The pacer has already spent this slot's budget, so
             // there is nothing to retry inline — the tunnel's 15 s
             // retransmit is what recovers it.
-            Err(e) => Err(WireError::Failed(e.to_string())),
+            Err(e) => {
+                let s = e.to_string();
+                // Bale refuses a message over the per-account bucket
+                // with `RPC error code=8 … user_rate_limited`. That
+                // used to arrive here as `Failed`, so the tunnel's
+                // 2 s/50-retry backoff (`run_sender`'s RateLimited
+                // arm) never once ran and the `rate_limited` stat
+                // sat at 0 no matter how hard we pushed. Typed
+                // error instead, detected on the one string the
+                // RPC layer actually renders.
+                if s.contains("user_rate_limited") {
+                    Err(WireError::RateLimited)
+                } else {
+                    Err(WireError::Failed(s))
+                }
+            }
         }
     }
 }
@@ -295,7 +317,12 @@ fn sink_slot(signaling: &Arc<BaleSignaling>) -> Arc<RwLock<Option<Arc<TextTunnel
 /// dropped from, because the window is only 8 deep and losing
 /// packets there would be our own doing rather than congestion.
 #[cfg(unix)]
-fn reader_loop(file: &File, tunnel: &TextTunnel, stop: &AtomicBool) {
+pub(crate) fn reader_loop(
+    file:     &File,
+    tunnel:   &TextTunnel,
+    stop:     &AtomicBool,
+    tx_bytes: Option<&AtomicU64>,
+) {
     let fmt = crate::tun::host_tun_format();
     'outer: while !stop.load(Ordering::Relaxed) {
         let pkt = match read_packet(file, POLL_MS, fmt) {
@@ -311,7 +338,12 @@ fn reader_loop(file: &File, tunnel: &TextTunnel, stop: &AtomicBool) {
                 break 'outer;
             }
             match tunnel.try_send_payload(pkt.clone()) {
-                Ok(()) => break,
+                Ok(()) => {
+                    if let Some(c) = tx_bytes {
+                        c.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
+                    break;
+                }
                 Err(Backpressure::Closed) => break 'outer,
                 Err(Backpressure::Oversized(n)) => {
                     log::warn!("text: {n}-byte packet exceeds a frame — dropped");
@@ -332,7 +364,12 @@ fn reader_loop(file: &File, tunnel: &TextTunnel, stop: &AtomicBool) {
 /// would block in `recv` until the sender dropped, and the sender
 /// lives inside the tunnel the guard is trying to release.
 #[cfg(unix)]
-fn writer_loop(file: &File, rx: mpsc::Receiver<Vec<u8>>, stop: &AtomicBool) {
+pub(crate) fn writer_loop(
+    file:     &File,
+    rx:       mpsc::Receiver<Vec<u8>>,
+    stop:     &AtomicBool,
+    rx_bytes: Option<&AtomicU64>,
+) {
     let fmt = crate::tun::host_tun_format();
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(POLL_MS as u64)) {
@@ -345,6 +382,9 @@ fn writer_loop(file: &File, rx: mpsc::Receiver<Vec<u8>>, stop: &AtomicBool) {
                 if let Err(e) = f.write_all(&wire) {
                     log::warn!("text: TUN write failed: {e}");
                     break;
+                }
+                if let Some(c) = rx_bytes {
+                    c.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
