@@ -41,12 +41,10 @@ use crate::server::{ClientInfo, ServerState};
 use crate::text_client::BaleTextWire;
 use crate::text_tunnel::{TextTunnel, TextWire};
 use bale_signaling::TextMessage;
-// `whoami` / `resolve_peer` / `fetch_display_name` are inherent
-// methods on `BaleSignaling`, not `Signaling` trait methods — the
-// trait would be an unused import (and clippy-fatal under -D
-// warnings). `Signaling` itself is only needed where calls are
-// placed, which this module never does.
-use lk_signaling::{CallDecision, PeerId};
+// `whoami` / `resolve_peer` / `fetch_display_name` are `Signaling`
+// trait methods (they live in the trait's impl block, not an inherent
+// one) — without this import the calls simply don't resolve.
+use lk_signaling::{CallDecision, PeerId, Signaling};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -98,7 +96,12 @@ struct Registry {
     admitting: HashSet<i32>,
 }
 
-fn registry() -> Arc<RwLock<Registry>> {
+/// Borrow, don't clone. Returning the `Arc` by value made every
+/// `let guard = registry().write()` bind a guard whose owner — the
+/// temporary `Arc` — died at the end of the statement (E0716);
+/// chaining `registry().write().x` happened to survive only because
+/// the temporary outlives the whole expression.
+fn registry() -> &'static RwLock<Registry> {
     REGISTRY
         .get_or_init(|| {
             Arc::new(RwLock::new(Registry {
@@ -106,7 +109,7 @@ fn registry() -> Arc<RwLock<Registry>> {
                 admitting: HashSet::new(),
             }))
         })
-        .clone()
+        .as_ref()
 }
 
 fn now_secs() -> u64 {
