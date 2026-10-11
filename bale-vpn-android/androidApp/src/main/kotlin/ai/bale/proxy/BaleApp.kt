@@ -37,7 +37,9 @@ class BaleApp : Application() {
                 BaleConnection.signaling?.setForeground(true)
             }
             override fun onStop(owner: LifecycleOwner) {
-                BaleConnection.signaling?.setForeground(false)
+                if (!BaleVpnService.isRunning && !BaleServerService.isRunning) {
+                    BaleConnection.signaling?.setForeground(false)
+                }
             }
         })
     }

@@ -6,6 +6,8 @@ import android.app.*
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.onSubscription
@@ -533,6 +535,10 @@ class BaleServerService : Service() {
         // over the WS gating.
         BaleConnection.setMode(Mode.CLIENT)
         isRunning       = false
+        if (!BaleVpnService.isRunning &&
+            !ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            BaleConnection.signaling?.setForeground(false)
+        }
         clientCount     = 0
         clientSnapshot  = emptyList()
         pendingSnapshot = emptyList()
