@@ -11,8 +11,11 @@ path = "src/lib.rs"
 
 [dependencies]
 # `sync` for the mpsc/Notify plumbing, `time` for the pacer's clock
-# and the stall timer. Everything else (rt, macros) is dev-only.
-tokio        = { version = "1", features = ["sync", "time"] }
+# and the stall timer. `macros` + `rt` are not optional either: the
+# sender loop is built on `tokio::select!` and `tokio::spawn`, and a
+# lib that spawns needs the runtime feature named explicitly — inside
+# `bale-vpn` those features arrived through the binary's own tokio.
+tokio        = { version = "1", features = ["sync", "time", "macros", "rt"] }
 parking_lot  = "0.12"
 # Payloads ride base64 over the text path: Bale rejects a binary
 # `Content` (member 3 of the union is a message field, not bytes).
