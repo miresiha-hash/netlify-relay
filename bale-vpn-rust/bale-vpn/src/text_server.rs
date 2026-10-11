@@ -38,7 +38,7 @@
 
 use crate::daemon::AppState;
 use crate::server::{ClientInfo, ServerState};
-use crate::text_client::BaleTextWire;
+use textcarrier::wire::BaleTextWire;
 use crate::text_tunnel::{TextTunnel, TextWire};
 use bale_signaling::TextMessage;
 // `whoami` / `resolve_peer` / `fetch_display_name` are `Signaling`
@@ -391,7 +391,7 @@ async fn admit(state: Arc<AppState>, uid: i32) {
     let reader = match std::thread::Builder::new()
         .name(format!("text-tun-reader-{slot}"))
         .spawn(move || {
-            crate::text_client::reader_loop(&file_r, &tunnel_r, &stop_r, Some(&*txb))
+            textcarrier::io::reader_loop(&file_r, &tunnel_r, &stop_r, Some(&*txb), crate::tun::host_tun_format())
         }) {
         Ok(h) => h,
         Err(e) => {
@@ -408,7 +408,7 @@ async fn admit(state: Arc<AppState>, uid: i32) {
     let writer = match std::thread::Builder::new()
         .name(format!("text-tun-writer-{slot}"))
         .spawn(move || {
-            crate::text_client::writer_loop(&file_w, pkt_rx, &stop_w, Some(&*rxb))
+            textcarrier::io::writer_loop(&file_w, pkt_rx, &stop_w, Some(&*rxb), crate::tun::host_tun_format())
         }) {
         Ok(h) => h,
         Err(e) => {

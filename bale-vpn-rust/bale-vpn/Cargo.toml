@@ -37,12 +37,6 @@ tokio = { version = "1", features = [
 ] }
 parking_lot = "0.12"
 async-trait = "0.1"
-# Base64 — payloads ride the *text* path on Bale: the server rejects a
-# binary `Content` (member 3 of the union is a message field, not bytes,
-# so any binary value comes back as `invalid wire-format`). This line
-# matches a version already in Cargo.lock through transitive deps, so it
-# pulls no new crates into the build.
-base64 = "0.22"
 
 # CLI parsing.
 clap = { version = "4", features = ["derive"] }

@@ -38,6 +38,16 @@ use base64::Engine as _;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, Notify};
 
+// ── Client-side session modules (split from bale-vpn's text_client) ──
+/// Outbound half: [`wire::BaleTextWire`], Bale signaling as a [`TextWire`].
+pub mod wire;
+/// The two OS-thread TUN loops (`poll(2)` reader + queue writer) + `read_packet`.
+#[cfg(unix)]
+pub mod io;
+/// The client session: tunnel, threads, process-wide sink slot, drop-teardown.
+#[cfg(unix)]
+pub mod session;
+
 // ── Limits ───────────────────────────────────────────────────────
 /// Bale accepts at most 4096 characters of content per message.
 pub const MAX_CONTENT_CHARS: usize = 4096;
