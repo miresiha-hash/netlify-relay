@@ -113,6 +113,22 @@ jobs:
           ANDROID_KEY_PASSWORD:     ${{ startsWith(github.ref, 'refs/tags/v') && secrets.ANDROID_KEY_PASSWORD     || '' }}
         run: ./gradlew :androidApp:assembleRelease --no-daemon --stacktrace
 
+      # Release signing only happens on a tag push, and needs the
+      # keystore secrets — which this repo does not have. A debug build
+      # signs itself with the runner's own debug keystore, so the APK it
+      # produces installs on a phone straight from any branch build.
+      # That is what makes a personal on-device test possible without
+      # publishing a release: same code, self-signed, installable.
+      - name: Build debug APK (self-signed)
+        run: ./gradlew :androidApp:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BaleVpn-debug-apk
+          path: bale-vpn-android/androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
