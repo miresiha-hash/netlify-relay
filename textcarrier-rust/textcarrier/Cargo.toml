@@ -18,6 +18,9 @@ parking_lot  = "0.12"
 # `Content` (member 3 of the union is a message field, not bytes).
 base64       = "0.22"
 async-trait  = "0.1"
+# The sender loop logs rate-limit backoffs and retransmits through the
+# facade, so callers plug in whatever logger they already run.
+log          = "0.4"
 
 [dev-dependencies]
 # The tunnel tests drive real tokio tasks with timers.
