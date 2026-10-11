@@ -34,6 +34,10 @@ crate-type = ["cdylib"]
 lktunnel       = { path = "../../../lktunnel-rust/lktunnel" }
 lk-signaling   = { path = "../../../lk-signaling-rust/lk-signaling" }
 bale-signaling = { path = "../../../bale-signaling-rust/bale-signaling" }
+# Text carrier: IP packets over Bale text messages. Its dep tree is a
+# subset of lktunnel's (bale-signaling + lk-signaling + tokio + base64),
+# so it adds no new native libs and no new livekit version constraint.
+textcarrier    = { path = "../../../textcarrier-rust/textcarrier" }
 jni-shared     = { path = "../jni-shared" }
 
 jni            = "0.21"

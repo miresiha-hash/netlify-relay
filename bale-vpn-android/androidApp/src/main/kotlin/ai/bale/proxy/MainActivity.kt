@@ -27,6 +27,9 @@ import kotlinx.coroutines.*
 class MainActivity : BaseActivity() {
 
     private lateinit var toggleMode:    MaterialButtonToggleGroup
+    /** Call ↔ Text carrier picker (client section only). Persisted under
+     *  the `carrier` pref and read once per connection by the service. */
+    private lateinit var toggleCarrier: MaterialButtonToggleGroup
     private lateinit var btnModeClient: MaterialButton
     private lateinit var btnModeServer: MaterialButton
     private lateinit var tvWsStatus:    TextView
@@ -132,6 +135,21 @@ class MainActivity : BaseActivity() {
             val mode = if (checkedId == R.id.btnModeClient) Mode.CLIENT else Mode.SERVER
             prefs.edit().putString("mode", mode.storageKey()).apply()
             switchToMode(mode)
+        }
+
+        // Carrier picker: Call (LiveKit + QUIC) vs Text (IP as Bale text
+        // messages on the WS). Persisted immediately; the service reads it
+        // once at connection start, so a carrier switch takes effect on the
+        // next Start — same contract as the VPN / SOCKS5 toggles.
+        toggleCarrier = findViewById(R.id.toggleCarrier)
+        toggleCarrier.check(
+            if (prefs.getString("carrier", "call") == "text") R.id.btnCarrierText
+            else R.id.btnCarrierCall
+        )
+        toggleCarrier.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked || updatingToggle) return@addOnButtonCheckedListener
+            val carrier = if (checkedId == R.id.btnCarrierText) "text" else "call"
+            prefs.edit().putString("carrier", carrier).apply()
         }
 
         btnWs.setOnClickListener {

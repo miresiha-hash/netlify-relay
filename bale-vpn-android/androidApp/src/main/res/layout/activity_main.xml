@@ -84,6 +84,35 @@
             android:layout_width="match_parent" android:layout_height="wrap_content"
             android:orientation="vertical">
 
+            <!-- Carrier picker: which transport carries this connection.
+                 "Call" = LiveKit call + QUIC (the original path);
+                 "Text" = IP packets as Bale text messages on the WS.
+                 Lives in the CLIENT section so it is hidden in server
+                 mode; the choice is persisted by MainActivity. -->
+            <com.google.android.material.button.MaterialButtonToggleGroup
+                android:id="@+id/toggleCarrier"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginBottom="16dp"
+                app:singleSelection="true"
+                app:selectionRequired="true">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnCarrierCall"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Call"/>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnCarrierText"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Text"/>
+
+            </com.google.android.material.button.MaterialButtonToggleGroup>
+
             <TextView android:id="@+id/tvPeer"
                 android:layout_width="wrap_content" android:layout_height="wrap_content"
                 android:textSize="15sp" android:alpha="0.7"
