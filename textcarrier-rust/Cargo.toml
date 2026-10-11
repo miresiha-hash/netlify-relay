@@ -27,3 +27,14 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 panic         = "abort"
+
+# ─── Stealth patch: local `livekit-api` copy ─────────────────────────────
+# Required since `lktunnel` entered the crate's graph (client-core
+# split): without this a standalone build here compiles crates.io
+# livekit-api — a second, wire-incompatible impl. Same release
+# (0.4.24), wire-identical transport, but the vendored copy matches
+# Bale's own web client join surface. Same block as bale-vpn-rust /
+# lktunnel-rust / bale-signaling-rust; the path is relative to this
+# top-level dir.
+[patch.crates-io]
+livekit-api = { path = "../vendor/livekit-api" }

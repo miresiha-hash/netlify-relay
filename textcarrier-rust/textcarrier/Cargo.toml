@@ -10,6 +10,15 @@ name = "textcarrier"
 path = "src/lib.rs"
 
 [dependencies]
+# The signaling stack — path deps into the sibling top-level
+# workspaces, same shape as bale-vpn/Cargo.toml's own declarations.
+# `bale-signaling` is the concrete client `BaleTextWire` sends
+# through; `lk-signaling` contributes `PeerId`.
+bale-signaling = { path = "../../bale-signaling-rust/bale-signaling" }
+lk-signaling   = { path = "../../lk-signaling-rust/lk-signaling" }
+# `lktunnel::tun` only (that module is cfg(unix), lktunnel/src/lib.rs):
+# `TunFormat` + wrap/unwrap for the TUN reader/writer loops.
+lktunnel       = { path = "../../lktunnel-rust/lktunnel" }
 # `sync` for the mpsc/Notify plumbing, `time` for the pacer's clock
 # and the stall timer. `macros` + `rt` are not optional either: the
 # sender loop is built on `tokio::select!` and `tokio::spawn`, and a
@@ -18,7 +27,8 @@ path = "src/lib.rs"
 tokio        = { version = "1", features = ["sync", "time", "macros", "rt"] }
 parking_lot  = "0.12"
 # Payloads ride base64 over the text path: Bale rejects a binary
-# `Content` (member 3 of the union is a message field, not bytes).
+# `Content` (member 3 of the union is a message field, not bytes,
+# so any binary value comes back as `invalid wire-format`).
 base64       = "0.22"
 async-trait  = "0.1"
 # The sender loop logs rate-limit backoffs and retransmits through the
@@ -28,3 +38,12 @@ log          = "0.4"
 [dev-dependencies]
 # The tunnel tests drive real tokio tasks with timers.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# poll(2) for the TUN reader deadline (io::read_packet) — unix-only,
+# mirroring bale-vpn's own target-gated libc. A `[target.…]` header
+# terminates the plain `[dependencies]` table, so this block MUST
+# stay at the END of this file: any dependency listed after it
+# silently becomes Unix-only (the exact bug bale-vpn's manifest
+# comment warns about).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
