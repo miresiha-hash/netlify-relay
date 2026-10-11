@@ -162,10 +162,12 @@ pub async fn install(state: Arc<AppState>) {
     // `tokio::spawn` there would panic with "no reactor running".
     let rt = tokio::runtime::Handle::current();
 
-    // One callback per process. It holds an Arc to the registry —
-    // never to a session — so a later install (mode re-entry) must
-    // not register a second one, and a teardown needs no unregister.
-    let reg_for_cb = reg.clone();
+    // One callback per process. It holds a `'static` borrow of the
+    // registry — never of a session — so a later install (mode
+    // re-entry) must not register a second one, and a teardown needs
+    // no unregister. `registry()` hands out a reference now, so this
+    // is a plain copy of it rather than an Arc clone.
+    let reg_for_cb = reg;
     let state_for_cb = state.clone();
     let sig = state.signaling.clone();
     let _ = CALLBACK_INSTALLED.get_or_init(move || {
