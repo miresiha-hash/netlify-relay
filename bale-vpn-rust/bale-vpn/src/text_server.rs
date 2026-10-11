@@ -94,6 +94,8 @@ struct Registry {
     /// the UI). Keeps a burst of first frames from spawning one
     /// admission per frame.
     admitting: HashSet<i32>,
+    /// Frames arriving while admission is in flight (capped at 16 per uid).
+    pending_frames: HashMap<i32, Vec<String>>,
 }
 
 /// Borrow, don't clone. Returning the `Arc` by value made every
@@ -107,6 +109,7 @@ fn registry() -> &'static RwLock<Registry> {
             Arc::new(RwLock::new(Registry {
                 sessions: HashMap::new(),
                 admitting: HashSet::new(),
+                pending_frames: HashMap::new(),
             }))
         })
         .as_ref()
@@ -193,13 +196,13 @@ pub async fn install(state: Arc<AppState>) {
                     e.tunnel.deliver(msg.sender_uid, &msg.text);
                     return;
                 }
-                // Unknown uid: either admission is already in
-                // flight, or this is a client knocking. Frames are
-                // NOT buffered before admission — the client's
-                // retransmit (text_tunnel's 15 s stalled-packet
-                // resend) recovers them, and buffering would mean
-                // holding unbounded plaintext IP packets for a peer
-                // nobody has approved yet.
+                // Unknown uid: either admission is already in flight,
+                // or this is a client knocking. Buffer up to 16 frames so
+                // the client's initial burst isn't dropped while admission runs.
+                let buf = w.pending_frames.entry(msg.sender_uid).or_default();
+                if buf.len() < 16 {
+                    buf.push(msg.text);
+                }
                 if !w.admitting.insert(msg.sender_uid) {
                     return; // already in flight
                 }
@@ -260,6 +263,7 @@ pub fn shutdown(server: &ServerState) {
     let drained: Vec<(i32, SessionEntry)> = {
         let mut w = registry().write();
         w.admitting.clear();
+        w.pending_frames.clear();
         w.sessions.drain().collect()
     };
     for (uid, e) in drained {
@@ -274,7 +278,9 @@ pub fn shutdown(server: &ServerState) {
 /// whether a session was actually removed.
 pub fn remove_one(server: &ServerState, peer_id: &str) -> bool {
     let Ok(uid) = peer_id.parse::<i32>() else { return false };
-    match registry().write().sessions.remove(&uid) {
+    let mut reg = registry().write();
+    reg.pending_frames.remove(&uid);
+    match reg.sessions.remove(&uid) {
         Some(e) => {
             let slot = teardown(e);
             server.release_kernel_slot(slot);
@@ -314,7 +320,9 @@ async fn admit(state: Arc<AppState>, uid: i32) {
     // Identity first: without a PeerId there is no wire to send on.
     let Some(peer) = state.signaling.resolve_peer(&uid_str).await else {
         log::warn!("text-server: cannot resolve uid {uid_str} — dropping contact");
-        registry().write().admitting.remove(&uid);
+        let mut reg = registry().write();
+        reg.admitting.remove(&uid);
+        reg.pending_frames.remove(&uid);
         return;
     };
     let display = state.signaling.fetch_display_name(&peer).await;
@@ -324,12 +332,16 @@ async fn admit(state: Arc<AppState>, uid: i32) {
     let decision =
         crate::server::decide_admission(&state.server, &uid_str, display.clone()).await;
     if !matches!(decision, CallDecision::Accept) {
-        registry().write().admitting.remove(&uid);
+        let mut reg = registry().write();
+        reg.admitting.remove(&uid);
+        reg.pending_frames.remove(&uid);
         return;
     }
     // A mode switch may have raced the (up to 60 s) admission park.
     if !RUNNING.load(Ordering::Relaxed) {
-        registry().write().admitting.remove(&uid);
+        let mut reg = registry().write();
+        reg.admitting.remove(&uid);
+        reg.pending_frames.remove(&uid);
         return;
     }
 
@@ -338,7 +350,9 @@ async fn admit(state: Arc<AppState>, uid: i32) {
     // `10.8.<K>.1/24`.
     let Some(slot) = state.server.alloc_kernel_slot() else {
         log::warn!("text-server: TUN slot pool exhausted — dropping {uid_str}");
-        registry().write().admitting.remove(&uid);
+        let mut reg = registry().write();
+        reg.admitting.remove(&uid);
+        reg.pending_frames.remove(&uid);
         return;
     };
     let name = format!("bale{slot}");
@@ -348,7 +362,9 @@ async fn admit(state: Arc<AppState>, uid: i32) {
         Err(e) => {
             log::warn!("text-server: open {name} ({addr}/24) failed for {uid_str}: {e}");
             state.server.release_kernel_slot(slot);
-            registry().write().admitting.remove(&uid);
+            let mut reg = registry().write();
+            reg.admitting.remove(&uid);
+            reg.pending_frames.remove(&uid);
             return;
         }
     };
@@ -397,7 +413,9 @@ async fn admit(state: Arc<AppState>, uid: i32) {
         Err(e) => {
             log::warn!("text-server: reader spawn failed for {uid_str}: {e}");
             state.server.release_kernel_slot(slot);
-            registry().write().admitting.remove(&uid);
+            let mut reg = registry().write();
+            reg.admitting.remove(&uid);
+            reg.pending_frames.remove(&uid);
             return;
         }
     };
@@ -416,16 +434,19 @@ async fn admit(state: Arc<AppState>, uid: i32) {
             stop.store(true, Ordering::Relaxed);
             let _ = reader.join();
             state.server.release_kernel_slot(slot);
-            registry().write().admitting.remove(&uid);
+            let mut reg = registry().write();
+            reg.admitting.remove(&uid);
+            reg.pending_frames.remove(&uid);
             return;
         }
     };
 
-    {
+    let pending = {
         let mut reg = registry().write();
         if !RUNNING.load(Ordering::Relaxed) {
             // Shutdown raced the installation — unwind.
             reg.admitting.remove(&uid);
+            reg.pending_frames.remove(&uid);
             drop(reg);
             stop.store(true, Ordering::Relaxed);
             let _ = reader.join();
@@ -434,10 +455,11 @@ async fn admit(state: Arc<AppState>, uid: i32) {
             return;
         }
         reg.admitting.remove(&uid);
+        let pending = reg.pending_frames.remove(&uid).unwrap_or_default();
         reg.sessions.insert(
             uid,
             SessionEntry {
-                tunnel,
+                tunnel: tunnel.clone(),
                 stop,
                 reader,
                 writer,
@@ -449,8 +471,12 @@ async fn admit(state: Arc<AppState>, uid: i32) {
                 last_activity,
             },
         );
+        pending
+    };
+    log::info!("text-server: session up for {uid_str} — {name} ({addr}/24) with {} buffered frames", pending.len());
+    for text in pending {
+        tunnel.deliver(uid, &text);
     }
-    log::info!("text-server: session up for {uid_str} — {name} ({addr}/24)");
 }
 
 // ── UI surface ──────────────────────────────────────────────────

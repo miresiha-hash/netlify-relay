@@ -12,6 +12,8 @@ import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ProcessLifecycleOwner
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.onSubscription
 
@@ -672,6 +674,10 @@ class BaleVpnService : VpnService() {
         Log.d(TAG, "stopVpn: isRunning=$isRunning isConnected=$isConnected")
         isRunning   = false
         isConnected = false
+        if (!BaleServerService.isRunning &&
+            !ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            BaleConnection.signaling?.setForeground(false)
+        }
         try { wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
         // transport.disconnect() closes the LkTunnel handle, whose

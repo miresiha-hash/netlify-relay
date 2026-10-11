@@ -81,11 +81,11 @@ pub const MAX_IN_FLIGHT: usize = 8;
 pub const ACK_EVERY_N: usize = 4;
 /// Hard upper bound on ACK latency, so an idle receiver still releases
 /// the sender's window instead of letting it stall into retransmits.
-pub const ACK_MAX_INTERVAL_MS: u64 = 2000;
+pub const ACK_MAX_INTERVAL_MS: u64 = 500;
 
 /// A frame still unacknowledged after this long is retransmitted.
 /// Retransmits are safe: the receiver de-duplicates by `seq`.
-pub const STALL_TIMEOUT_MS: u64 = 15_000;
+pub const STALL_TIMEOUT_MS: u64 = 4_000;
 /// How long to back off after the server says `user_rate_limited`.
 pub const RATE_LIMIT_BACKOFF_MS: u64 = 2_000;
 /// The sender task wakes at this cadence to flush due ACKs even when
@@ -582,13 +582,27 @@ impl TextTunnel {
                 .store(in_flight.len() as u32, Ordering::Relaxed);
 
             // Window full: wait for an ACK, or wake periodically to
-            // notice a stall.
+            // notice a stall. We MUST still drain out_rx so pending ACKs
+            // can be transmitted and break any bidirectional deadlocks.
             if in_flight.len() >= MAX_IN_FLIGHT {
-                tokio::select! {
-                    _ = self.inner.ack_notify.notified() => continue,
-                    _ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
-                        self.retransmit_stalled(&mut in_flight).await;
-                        continue;
+                let has_ack = buf.iter().any(|i| matches!(i, Outbound::Ack(_)));
+                if !has_ack {
+                    tokio::select! {
+                        _ = self.inner.ack_notify.notified() => continue,
+                        item = out_rx.recv() => {
+                            match item {
+                                Some(i) => {
+                                    buf.push_back(i);
+                                    continue;
+                                }
+                                None if buf.is_empty() => break,
+                                None => continue,
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
+                            self.retransmit_stalled(&mut in_flight).await;
+                            continue;
+                        }
                     }
                 }
             }
@@ -612,20 +626,29 @@ impl TextTunnel {
                 continue;
             }
 
-            // Token ready — pull the oldest queued work. Idle, we must
+            // Token ready — pull the oldest eligible work. Idle, we must
             // still wake on the tick: `maybe_flush_ack` runs at the top
             // of the loop, and a receiver with nothing to send would
             // otherwise sleep here forever and never release the peer's
             // window with an ACK.
-            let item = match buf.pop_front() {
-                Some(i) => i,
-                None => {
-                    tokio::select! {
-                        item = out_rx.recv() => match item {
-                            Some(i) => i,
-                            None => break,
-                        },
-                        _ = tick.tick() => continue,
+            // If the in-flight window is full, only ACK frames may be sent;
+            // data frames must wait until the peer advances our window.
+            let item = if in_flight.len() >= MAX_IN_FLIGHT {
+                match buf.iter().position(|i| matches!(i, Outbound::Ack(_))) {
+                    Some(pos) => buf.remove(pos).unwrap(),
+                    None => continue,
+                }
+            } else {
+                match buf.pop_front() {
+                    Some(i) => i,
+                    None => {
+                        tokio::select! {
+                            item = out_rx.recv() => match item {
+                                Some(i) => i,
+                                None => break,
+                            },
+                            _ = tick.tick() => continue,
+                        }
                     }
                 }
             };
@@ -1077,5 +1100,55 @@ mod tests {
             "the receiving side never emitted an ACK"
         );
         assert_eq!(ta.stats().sent_data, 16);
+    }
+
+    #[tokio::test]
+    async fn bidirectional_saturated_traffic_does_not_deadlock() {
+        let (ta, tb) = loopback();
+        let (got_a, sink_a) = collector();
+        let (got_b, sink_b) = collector();
+        ta.set_on_ip(sink_a);
+        tb.set_on_ip(sink_b);
+
+        // Both sides send 16 frames concurrently, each exceeding MAX_IN_FLIGHT (8).
+        // Before the fix, both sides saturated their window and deadlocked because
+        // neither side could emit ACKs to drain the other's window.
+        let send_a = tokio::spawn({
+            let ta = ta.clone();
+            async move {
+                for i in 0..16u8 {
+                    ta.send_payload(vec![i; 16]).await.expect("send_payload a");
+                }
+            }
+        });
+        let send_b = tokio::spawn({
+            let tb = tb.clone();
+            async move {
+                for i in 0..16u8 {
+                    tb.send_payload(vec![i.wrapping_add(100); 16]).await.expect("send_payload b");
+                }
+            }
+        });
+
+        tokio::try_join!(send_a, send_b).expect("send tasks finished");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let count_a = got_a.lock().len();
+            let count_b = got_b.lock().len();
+            if count_a >= 16 && count_b >= 16 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "deadlocked with a={count_a}/16 and b={count_b}/16 delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(got_a.lock().len(), 16);
+        assert_eq!(got_b.lock().len(), 16);
+        assert_eq!(ta.stats().sent_data, 16);
+        assert_eq!(tb.stats().sent_data, 16);
     }
 }
