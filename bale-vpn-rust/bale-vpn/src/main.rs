@@ -26,6 +26,12 @@ mod text_tunnel;
 // The `CarrierKind::Text` session that drives `text_tunnel` from a
 // kernel TUN: threads in, one Bale callback out, no call.
 mod text_client;
+// The server-side `CarrierKind::Text` acceptor — `text_client`'s
+// sibling: one TextTunnel + kernel-TUN slot per admitted client uid,
+// fed by the same one-shot process-wide text callback. Unix-only
+// like `tun` (a text session is kernel-TUN only).
+#[cfg(unix)]
+mod text_server;
 // Kernel-TUN device open/configure — Unix-only (uses `std::os::fd::RawFd`
 // + TUNSETIFF/utun ioctls). Windows server/client run userspace NAT and
 // never touch a kernel TUN, so the module isn't compiled there.

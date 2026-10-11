@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -319,6 +319,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct TextTunnel {
     inner: Arc<Inner>,
+    /// Whether this tunnel's send budget is shared with every other
+    /// `open_shared` tunnel — `true` only for the server side's
+    /// per-client tunnels. See `run_sender`.
+    shared: bool,
 }
 
 fn elapsed_ms(start: Instant) -> u64 {
@@ -329,6 +333,24 @@ impl TextTunnel {
     /// Start the transport. Spawns the sender task on the current
     /// tokio runtime, so it must be called from inside one.
     pub fn open(wire: Arc<dyn TextWire>, peer_uid: i32) -> Self {
+        Self::open_inner(wire, peer_uid, false)
+    }
+
+    /// Start the transport on a **process-shared** send budget.
+    ///
+    /// The text carrier's server side keeps one tunnel per client
+    /// uid, but Bale's limiter is a per-**user** token bucket (one
+    /// account, ~1 msg/s — calibrated live 2026-10-10, the constant
+    /// set above). Per-tunnel pacers would each spend the full rate,
+    /// so one busy client would trip `user_rate_limited` for every
+    /// other client. The client runs a single tunnel anyway, and
+    /// tests keep [`Self::open`]'s private budget so their timing
+    /// assertions stay isolated from each other.
+    pub fn open_shared(wire: Arc<dyn TextWire>, peer_uid: i32) -> Self {
+        Self::open_inner(wire, peer_uid, true)
+    }
+
+    fn open_inner(wire: Arc<dyn TextWire>, peer_uid: i32, shared: bool) -> Self {
         let (out_tx, out_rx) = mpsc::channel::<Outbound>(256);
         let inner = Arc::new(Inner {
             wire,
@@ -355,7 +377,7 @@ impl TextTunnel {
 
         // `run_sender` owns its handle (the spawned future must be
         // 'static), so hand it a clone — both share the same inner Arc.
-        let this = Self { inner: Arc::clone(&inner) };
+        let this = Self { inner: Arc::clone(&inner), shared };
         tokio::spawn(this.clone().run_sender(out_rx));
         this
     }
@@ -512,7 +534,19 @@ impl TextTunnel {
     /// The sender loop. Owns the pacer and the in-flight window — the
     /// only task that touches the wire.
     async fn run_sender(self, mut out_rx: mpsc::Receiver<Outbound>) {
-        let mut pacer = Pacer::new(BURST_CAPACITY, SUSTAINED_RATE, 0);
+        // Pacer: a process-wide budget when this tunnel came from
+        // `open_shared` (server side — one tunnel per client uid, all
+        // spending ONE Bale account's per-**user** bucket, module docs
+        // above, calibrated live 2026-10-10), otherwise a private one
+        // so tests and the single-tunnel client keep their own
+        // budget and their timing assertions stay honest.
+        static PROCESS_PACER: OnceLock<Mutex<Pacer>> = OnceLock::new();
+        let own_pacer = Mutex::new(Pacer::new(BURST_CAPACITY, SUSTAINED_RATE, 0));
+        let pacer: &Mutex<Pacer> = if self.shared {
+            PROCESS_PACER.get_or_init(|| Mutex::new(Pacer::new(BURST_CAPACITY, SUSTAINED_RATE, 0)))
+        } else {
+            &own_pacer
+        };
         let start = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -553,7 +587,7 @@ impl TextTunnel {
 
             // No token yet: wait for one, but keep draining the queue
             // so bursts aren't lost while we cool down.
-            let wait_ms = pacer.ms_until_next(now);
+            let wait_ms = pacer.lock().ms_until_next(now);
             if wait_ms > 0 {
                 tokio::select! {
                     item = out_rx.recv() => {
@@ -585,7 +619,7 @@ impl TextTunnel {
                     }
                 }
             };
-            if !pacer.try_acquire(elapsed_ms(start)) {
+            if !pacer.lock().try_acquire(elapsed_ms(start)) {
                 // Raced with another waiter; put it back and re-check.
                 buf.push_front(item);
                 continue;

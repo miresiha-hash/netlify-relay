@@ -14,7 +14,7 @@ use lktunnel::LkTunnel;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
 const DEFAULT_MAX_CLIENTS: u32 = 5;
@@ -185,7 +185,16 @@ impl ServerState {
 
     // ── Active clients ───────────────────────────────────────
 
-    pub async fn client_count(&self) -> usize { self.clients.lock().len() }
+    pub async fn client_count(&self) -> usize {
+        let n = self.clients.lock().len();
+        // Text sessions live in `text_server`'s own registry (they
+        // have no LkTunnel) but must count toward capacity and the
+        // status card exactly like voice ones. Unix-only — other
+        // platforms have no text carrier.
+        #[cfg(unix)]
+        let n = n + crate::text_server::session_count();
+        n
+    }
 
     pub async fn install_client(
         &self,
@@ -212,6 +221,11 @@ impl ServerState {
                 self.release_kernel_slot(slot);
             }
         }
+        // Text sessions aren't in this map (no LkTunnel) — the UI's
+        // kick route (`tunnel_client_disconnect`) must work for them
+        // too. No-op when the id isn't a live text session.
+        #[cfg(unix)]
+        crate::text_server::remove_one(self, peer_id);
     }
 
     /// Drop every connected client and cancel every pending
@@ -230,10 +244,16 @@ impl ServerState {
         // Drop every pending sender — the parked `decide()` calls
         // resolve to RecvError → SilentlyIgnore.
         self.pending.lock().clear();
+        // Text sessions aren't in this map (no LkTunnel to
+        // disconnect) — tear their tunnels down here too, so every
+        // clear path (mode switch, UI `/disconnect`, final shutdown)
+        // stops both carriers at once.
+        #[cfg(unix)]
+        crate::text_server::shutdown(self);
     }
 
     pub async fn client_infos(&self) -> Vec<ClientInfo> {
-        self.clients.lock().iter().map(|(peer_id, c)| {
+        let mut out: Vec<ClientInfo> = self.clients.lock().iter().map(|(peer_id, c)| {
             let stats = c.tunnel.stats();
             ClientInfo {
                 peer_id:      peer_id.clone(),
@@ -245,7 +265,61 @@ impl ServerState {
                 // UI's `fmtAge` wants epoch-ms.
                 connected_at_ms: c.connected_at.saturating_mul(1000),
             }
-        }).collect()
+        }).collect();
+        // Text-carrier sessions live in `text_server`'s own registry
+        // (they have no LkTunnel), but the UI's client list must show
+        // them identically. Unix-only — other platforms have no text
+        // carrier.
+        #[cfg(unix)]
+        out.extend(crate::text_server::client_infos());
+        out
+    }
+}
+
+/// Admission, factored out of `AdmissionDecider` (daemon.rs) so the
+/// Text acceptor (`text_server.rs`) applies the *same* rules by
+/// calling this: blacklist → capacity → allow-list → 60 s pending
+/// row on the UI. Text sessions take a kernel-TUN slot each, so they
+/// count toward capacity alongside voice ones.
+pub(crate) async fn decide_admission(
+    server:       &ServerState,
+    peer_str:     &str,
+    display_name: Option<String>,
+) -> CallDecision {
+    // Blocked callers: explicit reject so they see the call
+    // terminate immediately, not after a timeout.
+    if server.blacklist_list().await.iter().any(|p| p == peer_str) {
+        log::info!("server: rejecting blacklisted {peer_str}");
+        return CallDecision::Reject;
+    }
+    // Capacity rejection stays silent — caller is free to
+    // re-dial once a slot frees up. Text sessions are counted by
+    // `client_count` itself, so nothing carrier-specific here.
+    let used = server.client_count().await;
+    if used >= server.max_clients() as usize {
+        log::info!("server: at capacity — silently ignoring {peer_str}");
+        return CallDecision::SilentlyIgnore;
+    }
+    if server.admission_list().await.iter().any(|p| p == peer_str) {
+        return CallDecision::Accept;
+    }
+
+    // Park for user decision. The UI calls
+    // `/server/pending/<peer>/accept|reject` to resolve.
+    // 60 s default timeout matches the Android UX.
+    let (tx, rx) = oneshot::channel();
+    server.pending_park(peer_str.to_string(), display_name, tx).await;
+    let decision = tokio::time::timeout(Duration::from_secs(60), rx).await;
+    match decision {
+        Ok(Ok(d))  => d,
+        Ok(Err(_)) => CallDecision::SilentlyIgnore,    // sender dropped
+        Err(_)     => {
+            log::info!("server: pending decision timeout for {peer_str}");
+            // Best-effort: clear the pending entry so the
+            // UI doesn't show a stale row.
+            server.pending_resolve(peer_str, CallDecision::SilentlyIgnore).await;
+            CallDecision::SilentlyIgnore
+        }
     }
 }
 

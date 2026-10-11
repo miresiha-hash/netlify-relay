@@ -422,6 +422,24 @@ async fn run_server(state: &Arc<AppState>) -> Result<(), Box<dyn Error + Send + 
     // ignored so a transient WS hiccup (cardinality re-subscribes,
     // brief WS reconnect) can't drop a live LK session.
 
+    // ── Text carrier acceptor ────────────────────────────────────
+    // A Text client never places a call, so `accepted_sessions`
+    // (and thus `ServerTunnelManager`) never fires for it: it just
+    // starts sending framed IP packets addressed to our uid. This is
+    // the sibling acceptor — one TextTunnel + kernel-TUN slot per
+    // admitted client uid, sharing `ServerState`'s admission lists,
+    // capacity cap and pending UI with the voice path.
+    #[cfg(unix)]
+    {
+        if nat_mode == "kernel" {
+            crate::text_server::install(state.clone()).await;
+        } else {
+            log::warn!(
+                "server: text carrier disabled — needs kernel NAT (nat_mode={nat_mode})"
+            );
+        }
+    }
+
     log::info!("server: ready — parking until shutdown");
     std::future::pending::<()>().await;
     Ok(())
@@ -534,41 +552,10 @@ struct AdmissionDecider {
 #[async_trait::async_trait]
 impl lk_signaling::IncomingHandler for AdmissionDecider {
     async fn decide(&self, peer: PeerId, display_name: Option<String>) -> CallDecision {
-        let peer_str = peer.id_str().to_string();
-
-        // Blocked callers: explicit reject so they see the call
-        // terminate immediately, not after a timeout.
-        if self.server.blacklist_list().await.iter().any(|p| p == &peer_str) {
-            log::info!("server: rejecting blacklisted {peer_str}");
-            return CallDecision::Reject;
-        }
-        // Capacity rejection stays silent — caller is free to
-        // re-dial once a slot frees up.
-        if self.server.client_count().await >= self.server.max_clients() as usize {
-            log::info!("server: at capacity — silently ignoring {peer_str}");
-            return CallDecision::SilentlyIgnore;
-        }
-        if self.server.admission_list().await.iter().any(|p| p == &peer_str) {
-            return CallDecision::Accept;
-        }
-
-        // Park for user decision. The UI calls
-        // `/server/pending/<peer>/accept|reject` to resolve.
-        // 60 s default timeout matches the Android UX.
-        let (tx, rx) = oneshot::channel();
-        self.server.pending_park(peer_str.clone(), display_name, tx).await;
-        let decision = tokio::time::timeout(Duration::from_secs(60), rx).await;
-        match decision {
-            Ok(Ok(d))  => d,
-            Ok(Err(_)) => CallDecision::SilentlyIgnore,    // sender dropped
-            Err(_)     => {
-                log::info!("server: pending decision timeout for {peer_str}");
-                // Best-effort: clear the pending entry so the
-                // UI doesn't show a stale row.
-                self.server.pending_resolve(&peer_str, CallDecision::SilentlyIgnore).await;
-                CallDecision::SilentlyIgnore
-            }
-        }
+        // Shared with the Text acceptor (`text_server.rs` calls the
+        // same function): one set of admission rules, whatever the
+        // carrier.
+        crate::server::decide_admission(&self.server, peer.id_str(), display_name).await
     }
 }
 
