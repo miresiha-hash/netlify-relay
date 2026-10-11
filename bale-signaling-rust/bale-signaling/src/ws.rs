@@ -600,23 +600,73 @@ pub(crate) fn parse_text_message(raw: &[u8]) -> Option<TextMessage> {
 /// Field-level decode of the `Message` entity — see
 /// [`parse_text_message`] for the schema. `None` unless a
 /// `textMessage` content was actually found.
+///
+/// Two layouts are live in Bale's push traffic, and only one of them
+/// was captured end-to-end:
+///
+/// * the ported shape: `Content` under field 4, field 2 = rid.
+/// * what the web client actually receives (captured live through the
+///   running daemon): `1 Peer{1 peerType, 2 uid}`, `2 uid`, `3 date`,
+///   `4 date`, `5 Content{15 TextMessage{1 text}}`, plus unrelated
+///   fields 9 and 14.
+///
+/// Field 5 wins when both appear. Field 4 is kept because the older
+/// shape is still used elsewhere in the push family.
 fn parse_message_body(raw: &[u8]) -> Option<TextMessage> {
     let mut sender_uid = 0i32;
-    let mut rid        = 0i64;
-    let mut date       = 0i64;
+    let mut peer_uid     = 0i32;
+    let mut field2       = 0i64;
+    let mut date         = 0i64;
     let mut text: Option<String> = None;
+    let mut content_in_5 = false;
+
     let mut r = ProtoReader::new(raw);
     while r.has_more() {
         let (f, w) = r.tag().ok()?;
         match f {
             1 if w == 0 => sender_uid = r.varint().ok()? as i32,
-            2 if w == 0 => rid        = r.varint().ok()? as i64,
+            1 if w == 2 => peer_uid   = parse_peer_uid(r.bytes().ok()?),
+            2 if w == 0 => field2     = r.varint().ok()? as i64,
             3 if w == 0 => date       = r.varint().ok()? as i64,
-            4 if w == 2 => text = parse_text_content(r.bytes().ok()?),
+            4 if w == 2 => {
+                let body = r.bytes().ok()?;
+                if text.is_none() { text = parse_text_content(body); }
+            }
+            5 if w == 2 => {
+                let body = r.bytes().ok()?;
+                if let Some(t) = parse_text_content(body) {
+                    text = Some(t);
+                    content_in_5 = true;
+                }
+            }
             _           => r.skip(w).ok()?,
         }
     }
+
+    // `field 2` is a rid in the field-4 layout and the sender's uid in
+    // the field-5 one, so only read it as a rid for the older layout.
+    let rid = if content_in_5 { 0 } else { field2 };
+    if sender_uid == 0 {
+        sender_uid = if content_in_5 { field2 as i32 } else { peer_uid };
+    }
+
     text.map(|text| TextMessage { sender_uid, rid, date, text })
+}
+
+/// `Peer { 1 peerType, 2 uid, 3 accessHash }` — the sender's identity
+/// in the live push layout. 0 when the submessage carries no uid.
+fn parse_peer_uid(raw: &[u8]) -> i32 {
+    let mut uid = 0i32;
+    let mut r = ProtoReader::new(raw);
+    while r.has_more() {
+        let (f, w) = match r.tag() { Ok(tag) => tag, Err(_) => break };
+        if f == 2 && w == 0 {
+            uid = r.varint().unwrap_or(0) as i32;
+            break;
+        }
+        if r.skip(w).is_err() { break; }
+    }
+    uid
 }
 
 /// Pull the string out of a `Content` union body — only member 15
@@ -2806,6 +2856,46 @@ mod tests {
         let msg = parse_text_message(&raw).expect("wrapped body should decode");
         assert_eq!(msg.sender_uid, 99);
         assert_eq!(msg.text, "ping");
+    }
+
+    /// Minimal hex → bytes so wire captures can be checked in as
+    /// fixtures without pulling in a `hex` crate.
+    fn from_hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// The layout the live push actually uses, captured off a running
+    /// daemon that was carrying real TUN traffic: the sender is a
+    /// `Peer` submessage under field 1 (repeated as a bare uid at
+    /// field 2) and `Content` sits under field **5**, not field 4.
+    ///
+    /// Every real message parsed to `None` before this was handled,
+    /// so the text tunnel sent fine and silently never received a
+    /// byte — `recv` stayed 0 with the sender's window pinned full.
+    #[test]
+    fn live_push_layout_decodes_content_under_field_5() {
+        let raw = from_hex(concat!(
+            "0a08080110afe1a3b20410afe1a3b20418a4dbebc2923420f6daebc292",
+            "342a747a720a70415141414141454154474141414141414a4141422f6f",
+            "414141414141414143734b52457570544e354a66384341414141414141",
+            "4141414141414141414141425936414155434141414241493841484141",
+            "414141414242414141415038434141414141414141414141414166387a",
+            "6553553d4a0e08dce4eac2923410aee4eac292347208080110afe1a3b20",
+            "4",
+        ));
+        let msg = parse_text_message(&raw).expect("the live layout must decode");
+        assert_eq!(msg.sender_uid, 1179185327);
+        assert_eq!(msg.date, 1791678410148);
+        assert_eq!(msg.rid, 0, "field 2 is the uid here, not a rid");
+        assert_eq!(msg.text.len(), 112);
+        assert!(
+            msg.text.starts_with("AQAAAAEA"),
+            "payload must still be the tunnel's own frame, got {:?}",
+            &msg.text[..16]
+        );
     }
 
     /// `newMessage` with a non-text `Content` member (a photo)
