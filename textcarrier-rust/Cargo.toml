@@ -1,0 +1,29 @@
+# textcarrier-rust — workspace for the platform-portable byte
+# carrier that rides Bale text messages.
+#
+#   textcarrier/  pure transport core: the token-bucket pacer, the
+#                 frame codec, retransmit/ACK state machine, and the
+#                 `TextTunnel` itself. Zero knowledge of Bale, of the
+#                 HTTP UI, of config files or of TUN devices — the
+#                 peer side is the `TextWire` trait it defines, so a
+#                 caller supplies the messaging handle and owns the
+#                 socket end.
+#
+# Split out of `bale-vpn-rust/bale-vpn/src/text_tunnel.rs` (which had
+# no `crate::` references at all) so the same core links into both the
+# desktop/headless binary and the Android JNI shim — Android cannot
+# depend on the `bale-vpn` binary crate, and duplicating a 1000-line
+# retransmit state machine in Kotlin is how forks rot.
+[workspace]
+resolver = "2"
+members = ["textcarrier"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+panic         = "abort"

@@ -21,8 +21,12 @@ mod server;
 // Carrier (transport) selection — voice / text / file / god.
 mod carrier;
 // Byte transport over Bale text messages — the paced, windowed, ACK'd
-// path that carries TUN traffic when WebRTC isn't usable.
-mod text_tunnel;
+// path that carries TUN traffic when WebRTC isn't usable. It lives in
+// its own crate now (`textcarrier-rust/`) because the Android JNI shim
+// needs the same core and cannot depend on this binary crate; the alias
+// keeps every `crate::text_tunnel::…` path in `text_client` /
+// `text_server` resolving unchanged.
+use textcarrier as text_tunnel;
 // The `CarrierKind::Text` session that drives `text_tunnel` from a
 // kernel TUN: threads in, one Bale callback out, no call.
 mod text_client;

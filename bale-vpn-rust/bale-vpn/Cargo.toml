@@ -27,6 +27,9 @@ gui     = ["dep:tao", "dep:wry", "dep:muda"]
 lk-signaling   = { path = "../../lk-signaling-rust/lk-signaling" }
 bale-signaling = { path = "../../bale-signaling-rust/bale-signaling" }
 lktunnel       = { path = "../../lktunnel-rust/lktunnel" }
+# The text-message byte carrier (pacer + frame codec + TextTunnel).
+# Shared with the Android JNI shim — see textcarrier-rust/.
+textcarrier    = { path = "../../textcarrier-rust/textcarrier" }
 
 # Async runtime + concurrency primitives.
 tokio = { version = "1", features = [

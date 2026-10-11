@@ -15,6 +15,7 @@ on:
       - 'lktunnel-rust/**'
       - 'lk-signaling-rust/**'
       - 'bale-signaling-rust/**'
+      - 'textcarrier-rust/**'
       - 'bale-vpn-rust/**'
       - 'bale-vpn-android/rust/**'
       - 'vendor/**'
@@ -25,6 +26,7 @@ on:
       - 'lktunnel-rust/**'
       - 'lk-signaling-rust/**'
       - 'bale-signaling-rust/**'
+      - 'textcarrier-rust/**'
       - 'bale-vpn-rust/**'
       - 'bale-vpn-android/rust/**'
       - 'vendor/**'
@@ -124,6 +126,7 @@ jobs:
             lk-signaling-rust/target
             bale-signaling-rust/target
             bale-vpn-rust/target
+            textcarrier-rust/target
             bale-vpn-android/rust/target
           # Key on matrix.os, not runner.os: macos-latest (arm64) and
           # macos-26-intel (x86_64) both report runner.os == "macOS", so a
@@ -151,6 +154,23 @@ jobs:
         # `--no-deps` keeps clippy to our own crates; not gated on
         # warnings for now — run for visibility only.
         run: cargo clippy --workspace --release --no-deps
+
+      - name: cargo build --workspace
+        working-directory: textcarrier-rust
+        run: cargo build --workspace --release
+
+      - name: cargo clippy --workspace
+        working-directory: textcarrier-rust
+        # Not gated on warnings — visibility only, like lktunnel's.
+        run: cargo clippy --workspace --release --no-deps
+
+      # The text carrier moved out of `bale-vpn` into its own crate so
+      # the Android JNI shim can link the same core. Its tests moved
+      # with it, so `-p bale-vpn` below no longer runs them — this step
+      # is what keeps those 17 tests from silently never running again.
+      - name: cargo test (textcarrier)
+        working-directory: textcarrier-rust
+        run: cargo test --workspace --release
 
       # bale-vpn-rust — the single Rust binary replacing the
       # deleted Node app. Builds for host, exercises the HTTP
