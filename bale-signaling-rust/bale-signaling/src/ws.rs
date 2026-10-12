@@ -993,6 +993,11 @@ impl WsClient {
         let listeners = self.on_text_message.lock().clone();
         for cb in listeners { cb(msg.clone()); }
     }
+    pub(crate) fn fire_token_expired(&self) {
+        let cb = self.on_token_expired.lock().clone();
+        if let Some(cb) = cb { cb(); }
+    }
+
     /// Confirm a suspected-dead token before letting anyone destroy
     /// it. The WS upgrade is rejected with 401/403 for *any* reason
     /// the server can't distinguish: a genuinely revoked token, a
@@ -1620,7 +1625,7 @@ async fn run_loop(ws: Arc<WsClient>, access_token: String) {
                         log::warn!(
                             "WS: upgrade rejected — verifying token before expiry"
                         );
-                        Self::confirm_token_dead(t).await
+                        WsClient::confirm_token_dead(t).await
                     }
                     None => true, // nothing to preserve
                 };
