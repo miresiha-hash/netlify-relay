@@ -97,6 +97,16 @@ const MAX_SEND_RETRIES: u32 = 50;
 
 const KIND_DATA: u8 = 0x01;
 const KIND_ACK: u8 = 0x02;
+/// A frame carrying several length-prefixed datagrams.
+///
+/// This gets its own kind rather than being smuggled inside
+/// `KIND_DATA`: a bare datagram is indistinguishable from a packed
+/// one by inspection — an IPv4 packet starts `0x45 0x00`, which
+/// unpacks as a length-prefixed packet claiming 17664 bytes. Guessing
+/// would shred a legacy peer's datagrams. With an explicit kind the
+/// receiver never has to infer anything, and both peers ship from the
+/// same crate anyway.
+const KIND_BATCH: u8 = 0x03;
 
 // ── Framing ──────────────────────────────────────────────────────
 
@@ -107,6 +117,10 @@ pub enum Frame {
     Data { seq: u32, payload: Vec<u8> },
     /// Cumulative: every frame up to and including `cum` is delivered.
     Ack { cum: u32 },
+    /// Several datagrams in one message slot. The payload is already
+    /// packed by [`pack_packets`] at encode time, so the receiver just
+    /// unpacks it — no guessing about which framing was used.
+    Batch { seq: u32, payload: Vec<u8> },
 }
 
 /// Serialize a frame. [`Data`] frames are exactly
@@ -129,7 +143,76 @@ pub fn encode_frame(f: &Frame) -> Vec<u8> {
             v.extend_from_slice(&cum.to_be_bytes());
             v
         }
+        Frame::Batch { seq, payload } => {
+            let mut v = Vec::with_capacity(HEADER_LEN + payload.len());
+            v.push(KIND_BATCH);
+            v.extend_from_slice(&seq.to_be_bytes());
+            v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        }
     }
+}
+
+/// Length prefix for a packed datagram inside one frame.
+const PACK_LEN: usize = 2;
+
+/// Cap on datagrams per frame. Two MTU-1400 packets already fill 2800
+/// of the 3060 payload bytes, so this is a guard against pathological
+/// tiny packets producing oversized frames, not a throughput knob.
+const MAX_BATCH_PACKETS: usize = 8;
+
+/// Pack whole IP datagrams into a single frame payload, without ever
+/// splitting one: Bale transports datagrams, not bits, and a fragment
+/// would have to be reassembled by hand on a path with no checksum
+/// budget to spare. Returns `None` if the datagrams can't be packed
+/// without exceeding [`MAX_PAYLOAD_BYTES`] — the caller then sends the
+/// first one alone rather than losing data.
+pub fn pack_packets(pkts: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for p in pkts {
+        if p.is_empty() || p.len() > u16::MAX as usize {
+            return None;
+        }
+        out.extend_from_slice(&(p.len() as u16).to_be_bytes());
+        out.extend_from_slice(p);
+        if out.len() > MAX_PAYLOAD_BYTES {
+            return None;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Inverse of [`pack_packets`].
+///
+/// Only ever called on a payload whose frame kind is
+/// [`KIND_BATCH`], so the length prefixes are guaranteed to be there
+/// by construction — no heuristic sniffing of a bare datagram, which
+/// would misfire on IPv4's own `0x45 0x00` header. Anything that does
+/// not parse cleanly returns the payload whole, so a corrupt or
+/// truncated pack degrades to "hand it to the TUN" rather than
+/// silently eating datagrams.
+pub fn unpack_packets(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let Some((&n, tail)) = rest.split_at_checked(2) else {
+            return vec![payload.to_vec()];
+        };
+        let n = n as usize;
+        if n == 0 || tail.len() < n {
+            return if out.is_empty() {
+                vec![payload.to_vec()]
+            } else {
+                out.push(rest.to_vec());
+                out
+            };
+        }
+        let (pkt, tail2) = tail.split_at(n);
+        out.push(pkt.to_vec());
+        rest = tail2;
+    }
+    out
 }
 
 /// Parse a frame, rejecting anything short, truncated, or unknown.
@@ -158,6 +241,18 @@ pub fn decode_frame(b: &[u8]) -> Option<Frame> {
             Some(Frame::Ack {
                 cum: u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]),
             })
+        }
+        KIND_BATCH => {
+            if rest.len() < 6 {
+                return None;
+            }
+            let seq = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let len = u16::from_be_bytes([rest[4], rest[5]]) as usize;
+            let payload = &rest[6..];
+            if payload.len() != len {
+                return None;
+            }
+            Some(Frame::Batch { seq, payload: payload.to_vec() })
         }
         _ => None,
     }
@@ -285,14 +380,33 @@ pub type IpSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 enum Outbound {
     Data(Vec<u8>),
     Ack(u32),
+    /// Several IP packets packed into one frame, each length-prefixed.
+    ///
+    /// The sender is rate-limited per *message*, not per byte: Bale
+    /// accepts 4096 characters of `textMessage`, and a frame tops out
+    /// at 4092 base64 chars, but one MTU-1400 datagram only fills
+    /// ~1400 of those 3060 payload bytes. Sending each datagram as its
+    /// own frame therefore burns a whole message slot on 46% of a
+    /// frame's capacity, and the ceiling is ~1260 bytes/s regardless
+    /// of how much bandwidth the account actually has.
+    ///
+    /// Packing whole datagrams together raises that to ~92% (two
+    /// MTU-1400 packets = 2800 of 3060 bytes), doubling throughput
+    /// for exactly the same message count. The receiver unpacks with
+    /// [`unpack_packets`], so old and new peers stay wire-compatible:
+    /// a legacy peer's single-packet frames are still just a batch of
+    /// one.
+    Batch(Vec<Vec<u8>>),
 }
 
 /// Receiver-side reassembly state.
 struct RxState {
     /// Next `seq` that can be handed up. Everything below is delivered.
     next_contig: u32,
-    /// Out-of-order frames held until the gap fills.
-    buf: BTreeMap<u32, Vec<u8>>,
+    /// Out-of-order frames held until the gap fills. Values are the
+    /// datagrams a frame carries: one for `KIND_DATA`, several for
+    /// `KIND_BATCH`.
+    buf: BTreeMap<u32, Vec<Vec<u8>>>,
     ack_pending: bool,
     frames_since_ack: usize,
     last_ack_at: Option<Instant>,
@@ -469,6 +583,7 @@ impl TextTunnel {
         let Some(bytes) = unb64(text) else { return };
         match decode_frame(&bytes) {
             Some(Frame::Data { seq, payload }) => self.on_data(seq, payload),
+            Some(Frame::Batch { seq, payload }) => self.on_batch(seq, payload),
             Some(Frame::Ack { cum }) => self.on_ack(cum),
             None => {}
         }
@@ -482,7 +597,24 @@ impl TextTunnel {
     }
 
     fn on_data(&self, seq: u32, payload: Vec<u8>) {
-        let deliver = {
+        let deliver = self.ingest(seq, vec![payload]);
+        self.hand_off(&deliver);
+    }
+
+    /// A batch frame consumes one sequence number, exactly like a
+    /// single-datagram frame: it is one message, one window slot, one
+    /// ACK. Only its *contents* are plural.
+    fn on_batch(&self, seq: u32, payload: Vec<u8>) {
+        let pkts = unpack_packets(&payload);
+        let deliver = self.ingest(seq, pkts);
+        self.hand_off(&deliver);
+    }
+
+    /// Reorder-and-drain common to both frame kinds: drop duplicates,
+    /// park out-of-order frames, and release every frame that became
+    /// contiguous. Returns the datagrams to hand to the TUN.
+    fn ingest(&self, seq: u32, payload: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut deliver = {
             let mut st = self.inner.rx_state.lock();
             if seq < st.next_contig {
                 // Already handed up. Re-ack so a lost ACK doesn't
@@ -491,7 +623,7 @@ impl TextTunnel {
                 drop(st);
                 self.inner.dup_dropped.fetch_add(1, Ordering::Relaxed);
                 self.queue_ack(cum);
-                return;
+                return Vec::new();
             }
             st.buf.insert(seq, payload);
             st.frames_since_ack += 1;
@@ -507,21 +639,26 @@ impl TextTunnel {
             // never overlap through the guard.
             let mut deliver = Vec::new();
             let mut next = st.next_contig;
-            while let Some(p) = st.buf.remove(&next) {
-                deliver.push(p);
+            while let Some(fr) = st.buf.remove(&next) {
+                deliver.extend(fr);
                 next += 1;
             }
             st.next_contig = next;
             deliver
         };
+        deliver.shrink_to_fit();
+        deliver
+    }
 
+    fn hand_off(&self, deliver: &[Vec<u8>]) {
+        if deliver.is_empty() {
+            return;
+        }
         self.inner.recv_data.fetch_add(deliver.len() as u32, Ordering::Relaxed);
-        if !deliver.is_empty() {
-            let sink = self.inner.on_ip.lock();
-            if let Some(cb) = sink.as_ref() {
-                for p in &deliver {
-                    cb(p);
-                }
+        let sink = self.inner.on_ip.lock();
+        if let Some(cb) = sink.as_ref() {
+            for p in deliver {
+                cb(p);
             }
         }
     }
@@ -606,9 +743,12 @@ impl TextTunnel {
         let mut tick = tokio::time::interval(Duration::from_millis(TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // (seq, payload, when it was last sent) — payload retained so
-        // a stalled frame can be retransmitted.
-        let mut in_flight: VecDeque<(u32, Vec<u8>, Instant)> = VecDeque::new();
+        // (seq, payload, when it was last sent, is_batch) — payload retained
+        // so a stalled frame can be retransmitted byte-for-byte in the
+        // same framing it was first sent with; replaying a batch as a
+        // single `Data` frame would hand the peer one 2800-byte
+        // "datagram" and corrupt the stream.
+        let mut in_flight: VecDeque<(u32, Vec<u8>, Instant, bool)> = VecDeque::new();
         // Work received while waiting for a token, so nothing is lost.
         let mut buf: VecDeque<Outbound> = VecDeque::new();
         let mut next_seq: u32 = 0; // first frame uses seq 1
@@ -628,7 +768,7 @@ impl TextTunnel {
 
             // Release everything the peer has confirmed.
             let cum = self.inner.acked_cum.load(Ordering::Acquire);
-            while in_flight.front().map_or(false, |(s, _, _)| *s <= cum) {
+            while in_flight.front().map_or(false, |(s, _, _, _)| *s <= cum) {
                 in_flight.pop_front();
             }
             self.inner
@@ -711,6 +851,41 @@ impl TextTunnel {
                     }
                 }
             };
+            // Coalesce: a frame is one Bale message, and Bale meters
+            // messages, not bytes. When the oldest item is a datagram
+            // and the queue already holds more of them, folding the
+            // neighbours into the same frame fills the 3060-byte
+            // payload instead of spending a message slot per packet.
+            // This is pure win — one pacer token, one in-flight slot,
+            // one ACK, and up to 2800 useful bytes instead of 1400.
+            let item = match item {
+                Outbound::Data(first) => {
+                    let mut batch: Vec<Vec<u8>> = vec![first];
+                    let mut used = PACK_LEN + batch[0].len();
+                    while batch.len() < MAX_BATCH_PACKETS {
+                        let next_len = match buf.front() {
+                            Some(Outbound::Data(p)) if !p.is_empty() && p.len() <= u16::MAX as usize => p.len(),
+                            _ => break,
+                        };
+                        if used + PACK_LEN + next_len > MAX_PAYLOAD_BYTES {
+                            break;
+                        }
+                        match buf.pop_front() {
+                            Some(Outbound::Data(p)) => {
+                                used += PACK_LEN + p.len();
+                                batch.push(p);
+                            }
+                            _ => break,
+                        }
+                    }
+                    if batch.len() == 1 {
+                        Outbound::Data(batch.pop().unwrap())
+                    } else {
+                        Outbound::Batch(batch)
+                    }
+                }
+                other => other,
+            };
             if !pacer.lock().try_acquire(elapsed_ms(start)) {
                 // Raced with another waiter; put it back and re-check.
                 buf.push_front(item);
@@ -720,19 +895,37 @@ impl TextTunnel {
             // Compute the seq this frame *would* use, but only commit
             // it once the send is accepted. Advancing early would leave
             // a hole the receiver's cumulative ACK waits on forever.
-            let (text, data_payload, candidate_seq) = match &item {
+            let (text, data_payload, candidate_seq, is_batch) = match &item {
                 Outbound::Data(p) => {
                     let seq = next_seq.wrapping_add(1);
                     (
                         b64(&encode_frame(&Frame::Data { seq, payload: p.clone() })),
                         Some(p.clone()),
                         seq,
+                        false,
+                    )
+                }
+                Outbound::Batch(pkts) => {
+                    let seq = next_seq.wrapping_add(1);
+                    // The coalescing loop above measured the exact
+                    // packed size and refused anything over the cap,
+                    // so this cannot fail. Fall back to the first
+                    // datagram alone rather than dropping data if it
+                    // somehow does.
+                    let payload = pack_packets(pkts)
+                        .unwrap_or_else(|| pkts[0].clone());
+                    (
+                        b64(&encode_frame(&Frame::Batch { seq, payload })),
+                        Some(payload),
+                        seq,
+                        true,
                     )
                 }
                 Outbound::Ack(cum) => (
                     b64(&encode_frame(&Frame::Ack { cum: *cum })),
                     None,
                     next_seq,
+                    false,
                 ),
             };
 
@@ -741,7 +934,7 @@ impl TextTunnel {
                     rate_limit_streak = 0;
                     if let Some(p) = data_payload {
                         next_seq = candidate_seq;
-                        in_flight.push_back((candidate_seq, p, Instant::now()));
+                        in_flight.push_back((candidate_seq, p, Instant::now(), is_batch));
                         self.inner.in_flight_count
                             .store(in_flight.len() as u32, Ordering::Relaxed);
                         self.inner.sent_data.fetch_add(1, Ordering::Relaxed);
@@ -822,16 +1015,23 @@ impl TextTunnel {
     /// receiver drops duplicates by `seq`.
     async fn retransmit_stalled(
         &self,
-        in_flight: &mut VecDeque<(u32, Vec<u8>, Instant)>,
+        in_flight: &mut VecDeque<(u32, Vec<u8>, Instant, bool)>,
         pacer: &Mutex<Pacer>,
         start: Instant,
     ) {
         // `Vec` in the tuple means this needs `cloned()`, not `copied()`.
-        let Some((seq, payload, sent_at)) = in_flight.front().cloned() else { return };
+        let Some((seq, payload, sent_at, is_batch)) = in_flight.front().cloned() else { return };
         if sent_at.elapsed() < Duration::from_millis(STALL_TIMEOUT_MS) {
             return;
         }
-        let text = b64(&encode_frame(&Frame::Data { seq, payload }));
+        // Replay in the framing it was first sent with. A batch replayed
+        // as `Data` would arrive as one oversized "datagram" and
+        // corrupt the peer's stream.
+        let text = if is_batch {
+            b64(&encode_frame(&Frame::Batch { seq, payload }))
+        } else {
+            b64(&encode_frame(&Frame::Data { seq, payload }))
+        };
         // Retransmits used to bypass the pacer entirely, so a stalled
         // peer pushed the real send rate to BURST + SUSTAINED (1.15/s)
         // and tripped Bale's rate limiter — which is exactly what keeps
@@ -1260,5 +1460,101 @@ mod tests {
         assert_eq!(got_b.lock().len(), 16);
         assert_eq!(ta.stats().sent_data, 16);
         assert_eq!(tb.stats().sent_data, 16);
+    }
+
+    #[test]
+    fn pack_round_trip_preserves_every_datagram() {
+        let pkts: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8; 100 + i * 37]).collect();
+        let packed = pack_packets(&pkts).expect("fits");
+        assert!(packed.len() <= MAX_PAYLOAD_BYTES);
+        assert_eq!(unpack_packets(&packed), pkts);
+    }
+
+    #[test]
+    fn pack_refuses_to_exceed_the_frame_cap() {
+        // Two full-size datagrams plus the length prefixes must fit;
+        // a third must not, and must be refused rather than truncated.
+        let two = vec![vec![7u8; 1400], vec![8u8; 1400]];
+        assert!(pack_packets(&two).is_some());
+        let three = vec![vec![7u8; 1400], vec![8u8; 1400], vec![9u8; 1400]];
+        assert!(pack_packets(&three).is_none());
+    }
+
+    #[test]
+    fn a_legacy_unprefixed_payload_survives_unpack() {
+        // An old peer sends the datagram with no length prefix. It must
+        // reach the TUN intact, not be shredded by the pack parser.
+        let raw = vec![0x45u8; 1400];
+        assert_eq!(unpack_packets(&raw), vec![raw.clone()]);
+    }
+
+    #[test]
+    fn empty_payload_is_rejected_rather_than_returned() {
+        assert!(pack_packets(&[]).is_none());
+        assert!(pack_packets(&[vec![]]).is_none());
+    }
+
+    #[test]
+    fn batch_frame_round_trips_through_the_wire() {
+        // The whole point: N datagrams out, N datagrams delivered, in
+        // ONE message slot. If this regresses to one-per-message the
+        // batching buys nothing.
+        let pkts: Vec<Vec<u8>> = (0..4).map(|i| vec![(i + 1) as u8; 900]).collect();
+        let packed = pack_packets(&pkts).expect("fits");
+        let frame = encode_frame(&Frame::Batch { seq: 42, payload: packed });
+        match decode_frame(&frame) {
+            Some(Frame::Batch { seq, payload }) => {
+                assert_eq!(seq, 42);
+                assert_eq!(unpack_packets(&payload), pkts);
+            }
+            other => panic!("expected a batch frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_and_data_frames_do_not_collide() {
+        // The whole reason batch got its own kind. A bare IPv4
+        // datagram begins 0x45 0x00, which a pack parser reads as a
+        // length prefix of 17664. Verify the kind byte alone decides,
+        // so a legacy peer's packet can never be shredded.
+        let datagram = vec![0x45u8, 0x00, 0x00, 0x30];
+        datagram.extend(std::iter::repeat(0u8).take(1396));
+        let text = b64(&encode_frame(&Frame::Data { seq: 7, payload: datagram.clone() }));
+        let bytes = unb64(&text).expect("decodes");
+        match decode_frame(&bytes) {
+            Some(Frame::Data { seq, payload }) => {
+                assert_eq!(seq, 7);
+                assert_eq!(payload, datagram, "datagram must survive untouched");
+            }
+            other => panic!("a data frame decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_mtu_datagrams_share_one_frame() {
+        // The throughput claim, asserted rather than assumed.
+        let two = vec![vec![0x45u8; 1400], vec![0x45u8; 1400]];
+        let packed = pack_packets(&two).expect("two MTU packets must fit");
+        let frame = encode_frame(&Frame::Batch { seq: 1, payload: packed });
+        assert!(frame.len() <= HEADER_LEN + MAX_PAYLOAD_BYTES);
+        assert_eq!(unpack_packets(&frame[HEADER_LEN..]), two);
+
+        // The only thing Bale's per-user limiter counts is messages.
+        // One batch frame must therefore stay within the 4096-character
+        // textMessage ceiling that two separate frames would each have
+        // to fit inside — and it must cost ONE message, not two.
+        let as_one_message = b64(&frame).len();
+        assert!(
+            as_one_message <= 4096,
+            "batch frame needs {as_one_message} chars, over Bale's 4096 limit"
+        );
+        let separate: usize = two
+            .iter()
+            .map(|p| b64(&encode_frame(&Frame::Data { seq: 1, payload: p.clone() })).len())
+            .sum();
+        assert!(
+            as_one_message <= separate,
+            "batching must never cost more characters than sending separately"
+        );
     }
 }
