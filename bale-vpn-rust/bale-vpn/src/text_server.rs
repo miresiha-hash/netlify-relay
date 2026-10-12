@@ -294,17 +294,22 @@ pub fn remove_one(server: &ServerState, peer_id: &str) -> bool {
 /// Stop one session: signal both threads, join them, then let the
 /// entry drop — the threads hold the last `Arc<File>` refs, so the
 /// TUN fd closes after they exit (the kernel removes the interface
-/// with it), and the `Arc<TextTunnel>` drop takes the tunnel's
-/// sender task with it. Returns the freed slot.
+/// with it). The tunnel needs an explicit `close()`: the sender task
+/// holds an `Arc<Inner>` and `Inner` holds the channel's send half, so
+/// dropping our `Arc<TextTunnel>` ref cannot reach it. Without the call
+/// the task keeps retransmitting a dead frame into the peer's chat
+/// forever. Returns the freed slot.
 fn teardown(e: SessionEntry) -> u8 {
     let SessionEntry {
         stop,
         reader,
         writer,
         slot,
+        tunnel,
         ..
     } = e;
     stop.store(true, Ordering::Relaxed);
+    tunnel.close();
     let _ = reader.join();
     let _ = writer.join();
     slot

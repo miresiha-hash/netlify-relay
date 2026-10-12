@@ -993,9 +993,44 @@ impl WsClient {
         let listeners = self.on_text_message.lock().clone();
         for cb in listeners { cb(msg.clone()); }
     }
-    pub(crate) fn fire_token_expired(&self) {
-        let cb = self.on_token_expired.lock().clone();
-        if let Some(cb) = cb { cb(); }
+    /// Confirm a suspected-dead token before letting anyone destroy
+    /// it. The WS upgrade is rejected with 401/403 for *any* reason
+    /// the server can't distinguish: a genuinely revoked token, a
+    /// token for a session the server just evicted, a second socket
+    /// using the same token, or a transient edge rejection. Clearing
+    /// on the first 401 is unrecoverable — there is no refresh path
+    /// in the Bale protocol, so a false positive costs the user a
+    /// manual OTP round-trip.
+    ///
+    /// So: on the *first* ambiguous rejection, retry the handshake
+    /// once after a short backoff. Only if that retry also fails do
+    /// we report expiry — at which point the token is worthless
+    /// regardless of cause, and clearing it loses nothing.
+    async fn confirm_token_dead(token: &str) -> bool {
+        const RETRY_DELAY_MS: u64 = 2_500;
+        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        let request = build_upgrade_request(token);
+        match connect_async(request).await {
+            Ok(_) => {
+                log::info!(
+                    "WS: upgrade retried OK after 401 — token still valid, keeping it"
+                );
+                false
+            }
+            Err(tungstenite::Error::Http(resp))
+                    if matches!(resp.status().as_u16(), 401 | 403) => true,
+            Err(e) => {
+                // A network/transport failure is NOT proof the token
+                // died. Report the rejection as not-confirmed so the
+                // token survives and the normal backoff reconnect
+                // can retry it.
+                log::warn!(
+                    "WS: upgrade retry failed for a non-auth reason ({e}) — \
+                     treating token as still valid"
+                );
+                false
+            }
+        }
     }
     pub(crate) fn fire_version_mismatch(&self) {
         let cb = self.on_version_mism.lock().clone();
@@ -1574,9 +1609,33 @@ async fn run_loop(ws: Arc<WsClient>, access_token: String) {
 
         match outcome {
             SessionOutcome::TokenExpired => {
-                log::warn!("WS: token expired — stopping reconnect loop");
-                ws.fire_token_expired();
-                break;
+                // A 401/403 on the upgrade is not proof the token
+                // died — the server won't tell us *why*. Re-test the
+                // handshake once before destroying a token we cannot
+                // refresh. Clearing on the first ambiguous rejection
+                // cost us the server token outright.
+                let access = ws.access_token.lock().clone();
+                let confirmed = match access {
+                    Some(ref t) => {
+                        log::warn!(
+                            "WS: upgrade rejected — verifying token before expiry"
+                        );
+                        Self::confirm_token_dead(t).await
+                    }
+                    None => true, // nothing to preserve
+                };
+                if confirmed {
+                    log::warn!(
+                        "WS: token expired (confirmed) — stopping reconnect loop"
+                    );
+                    ws.fire_token_expired();
+                    break;
+                }
+                log::info!(
+                    "WS: token survived re-test — continuing backoff reconnect"
+                );
+                // Fall through to the normal backoff reconnect, which
+                // will retry the same token rather than dropping it.
             }
             SessionOutcome::VersionMismatch => {
                 log::warn!("WS: server proto/api version mismatch — stopping reconnect loop");

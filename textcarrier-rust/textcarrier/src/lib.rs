@@ -306,6 +306,14 @@ struct Inner {
     peer_uid: i32,
     on_ip: Mutex<Option<IpSink>>,
     out_tx: mpsc::Sender<Outbound>,
+    /// Fires when the tunnel is torn down so `run_sender` can stop.
+    /// Required, not cosmetic: the sender task holds `Arc<Inner>` and
+    /// `Inner` holds the sender half of `out_tx`, so dropping the
+    /// `TextTunnel` alone never terminates it. The task would outlive
+    /// its tunnel forever, retransmitting a dead frame indefinitely.
+    cancel: Notify,
+    /// Set by `TextTunnel::close`. The sender polls it and exits.
+    closed: AtomicBool,
     rx_state: Mutex<RxState>,
     /// Cumulative ACK from the peer: everything `<= this` is delivered
     /// there and can be dropped here.
@@ -367,6 +375,8 @@ impl TextTunnel {
             peer_uid,
             on_ip: Mutex::new(None),
             out_tx,
+            cancel: Notify::new(),
+            closed: AtomicBool::new(false),
             rx_state: Mutex::new(RxState {
                 next_contig: 1,
                 buf: BTreeMap::new(),
@@ -387,9 +397,32 @@ impl TextTunnel {
 
         // `run_sender` owns its handle (the spawned future must be
         // 'static), so hand it a clone — both share the same inner Arc.
+        // The task also watches `inner.closed`: dropping `TextTunnel`
+        // cannot kill it (Arc cycle through `out_tx`), so `close()`
+        // must set the flag and notify, or the task keeps retransmitting
+        // a dead frame forever and floods the peer chat.
         let this = Self { inner: Arc::clone(&inner), shared };
-        tokio::spawn(this.clone().run_sender(out_rx));
+        let sender = this.clone();
+        let guard = Arc::clone(&inner);
+        tokio::spawn(async move {
+            sender.run_sender(out_rx, guard).await;
+        });
         this
+    }
+
+    /// Tear the tunnel down: stop the sender task and drop the payload
+    /// sink. Safe to call repeatedly.
+    ///
+    /// Both halves matter. Clearing `on_ip` stops further payloads
+    /// reaching the TUN, and setting `closed` is what actually ends the
+    /// sender task — without it the task survives this `TextTunnel`
+    /// because it holds the same `Arc<Inner>`, and its retransmit loop
+    /// keeps emitting frames for a peer that is already gone.
+    pub fn close(&self) {
+        self.inner.on_ip.lock().take();
+        if !self.inner.closed.swap(true, Ordering::Relaxed) {
+            self.inner.cancel.notify_waiters();
+        }
     }
 
     /// Install the payload sink. Call once, before traffic flows.
@@ -497,7 +530,17 @@ impl TextTunnel {
     /// sync callback, so it must never block. A dropped ACK costs one
     /// retransmit 15 s later, which the receiver de-duplicates.
     fn queue_ack(&self, cum: u32) {
-        let _ = self.inner.out_tx.try_send(Outbound::Ack(cum));
+        // `try_send` can legitimately fail (full channel) and must not
+        // block a sync callback — but a dropped ACK is never harmless:
+        // the peer's window is cumulative, so losing one stalls it
+        // until a 15 s retransmit lands. Re-arm `ack_pending` so the
+        // next tick re-sends instead of silently swallowing it.
+        if self.inner.out_tx.try_send(Outbound::Ack(cum)).is_err() {
+            let mut st = self.inner.rx_state.lock();
+            st.ack_pending = true;
+            st.frames_since_ack = ACK_EVERY_N; // make it due immediately
+            st.last_ack_at = None;
+        }
     }
 
     /// Called each sender tick: flush a queued ACK once it is due by
@@ -515,7 +558,9 @@ impl TextTunnel {
             if !by_count && !by_time {
                 return;
             }
-            st.ack_pending = false;
+            // Leave `ack_pending` armed until the send actually lands — setting
+            // it false first meant a full channel silently dropped the
+            // ACK and never regenerated one.
             st.frames_since_ack = 0;
             st.last_ack_at = Some(Instant::now());
             st.next_contig - 1
@@ -543,7 +588,7 @@ impl TextTunnel {
 
     /// The sender loop. Owns the pacer and the in-flight window — the
     /// only task that touches the wire.
-    async fn run_sender(self, mut out_rx: mpsc::Receiver<Outbound>) {
+    async fn run_sender(self, mut out_rx: mpsc::Receiver<Outbound>, guard: Arc<Inner>) {
         // Pacer: a process-wide budget when this tunnel came from
         // `open_shared` (server side — one tunnel per client uid, all
         // spending ONE Bale account's per-**user** bucket, module docs
@@ -570,6 +615,15 @@ impl TextTunnel {
         let mut rate_limit_streak: u32 = 0;
 
         loop {
+            // Teardown check. `closed` is the ONLY thing that ends this
+            // task: the channel's send half lives inside the same
+            // `Arc<Inner>` the task holds, so `recv()` can never return
+            // `None` on its own and the task is structurally immortal.
+            if guard.closed.load(Ordering::Relaxed) {
+                log::info!("text_tunnel: sender stopping (tunnel closed)");
+                guard.in_flight_count.store(0, Ordering::Relaxed);
+                return;
+            }
             self.maybe_flush_ack();
 
             // Release everything the peer has confirmed.
@@ -589,6 +643,11 @@ impl TextTunnel {
                 if !has_ack {
                     tokio::select! {
                         _ = self.inner.ack_notify.notified() => continue,
+                        _ = guard.cancel.notified() => {
+                            log::info!("text_tunnel: sender stopping (tunnel closed)");
+                            guard.in_flight_count.store(0, Ordering::Relaxed);
+                            return;
+                        }
                         item = out_rx.recv() => {
                             match item {
                                 Some(i) => {
@@ -600,7 +659,7 @@ impl TextTunnel {
                             }
                         }
                         _ = tokio::time::sleep(Duration::from_millis(TICK_MS)) => {
-                            self.retransmit_stalled(&mut in_flight).await;
+                            self.retransmit_stalled(&mut in_flight, pacer, start).await;
                             continue;
                         }
                     }
@@ -688,6 +747,11 @@ impl TextTunnel {
                         self.inner.sent_data.fetch_add(1, Ordering::Relaxed);
                     } else {
                         self.inner.sent_ack.fetch_add(1, Ordering::Relaxed);
+                        // ACK is out, so the pending flag can finally be
+                        // retired. Doing this here (not before the send)
+                        // is what makes a dropped ACK retry instead of
+                        // vanishing.
+                        self.inner.rx_state.lock().ack_pending = false;
                     }
                 }
                 Err(WireError::RateLimited) => {
@@ -698,6 +762,25 @@ impl TextTunnel {
                             "text_tunnel: giving up after {rate_limit_streak} rate-limit retries"
                         );
                         rate_limit_streak = 0;
+                        // The seq this frame consumed is now a permanent
+                        // HOLE: the peer can never advance `next_contig`
+                        // past it, so its cumulative ACK freezes and the
+                        // 8-frame window stays shut forever — the tunnel
+                        // looks connected and passes zero bytes.
+                        // Since we gave up on the peer anyway, reset the
+                        // window and the counter together so numbering
+                        // restarts instead of stranding the session.
+                        if data_payload.is_some() {
+                            log::warn!(
+                                "text_tunnel: resetting seq window after abandoned frame \
+                                 seq={candidate_seq} (peer would stall on the hole)"
+                            );
+                            in_flight.clear();
+                            self.inner
+                                .in_flight_count
+                                .store(0, Ordering::Relaxed);
+                            next_seq = 0;
+                        }
                         continue;
                     }
                     // The frame was never accepted, so retry it after
@@ -715,6 +798,19 @@ impl TextTunnel {
                         if rate_limit_streak <= MAX_SEND_RETRIES {
                             buf.push_front(Outbound::Data(p));
                             tokio::time::sleep(Duration::from_millis(RATE_LIMIT_BACKOFF_MS)).await;
+                        } else {
+                            // Same permanent hole as the rate-limit
+                            // path: an abandoned seq freezes the peer's
+                            // cumulative ACK and shuts the window.
+                            log::warn!(
+                                "text_tunnel: resetting seq window after abandoned frame \
+                                 seq={candidate_seq} ({e})"
+                            );
+                            in_flight.clear();
+                            self.inner
+                                .in_flight_count
+                                .store(0, Ordering::Relaxed);
+                            next_seq = 0;
                         }
                     }
                 }
@@ -724,13 +820,27 @@ impl TextTunnel {
 
     /// Resend the oldest unacknowledged frame. Safe because the
     /// receiver drops duplicates by `seq`.
-    async fn retransmit_stalled(&self, in_flight: &mut VecDeque<(u32, Vec<u8>, Instant)>) {
+    async fn retransmit_stalled(
+        &self,
+        in_flight: &mut VecDeque<(u32, Vec<u8>, Instant)>,
+        pacer: &Mutex<Pacer>,
+        start: Instant,
+    ) {
         // `Vec` in the tuple means this needs `cloned()`, not `copied()`.
         let Some((seq, payload, sent_at)) = in_flight.front().cloned() else { return };
         if sent_at.elapsed() < Duration::from_millis(STALL_TIMEOUT_MS) {
             return;
         }
         let text = b64(&encode_frame(&Frame::Data { seq, payload }));
+        // Retransmits used to bypass the pacer entirely, so a stalled
+        // peer pushed the real send rate to BURST + SUSTAINED (1.15/s)
+        // and tripped Bale's rate limiter — which is exactly what keeps
+        // the stall alive. Spend a pacer token like any other frame.
+        if !pacer.lock().try_acquire(elapsed_ms(start)) {
+            // No token available: leave the timestamp untouched so the
+            // next tick tries again instead of spinning.
+            return;
+        }
         match self.inner.wire.send(&text).await {
             Ok(()) => {
                 self.inner.retransmits.fetch_add(1, Ordering::Relaxed);

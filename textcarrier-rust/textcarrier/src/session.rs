@@ -213,7 +213,16 @@ struct Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Order matters. The slot goes first because it owns an
+        // Order matters. First: close the tunnel explicitly. Clearing
+        // the slot only drops *our* `Arc<TextTunnel>` ref, but the
+        // sender task holds its own `Arc<Inner>` and `Inner` owns the
+        // channel's send half — so the task is structurally immortal
+        // and would keep retransmitting a dead frame into the peer's
+        // chat forever. `close()` is what actually stops it.
+        if let Some(t) = self.slot.read().as_ref() {
+            t.close();
+        }
+        // Then the slot goes first because it owns an
         // `Arc<TextTunnel>`, which keeps the writer's queue alive;
         // then the stop flag; then join, so the next mode never
         // finds a stale reader still stealing packets from
