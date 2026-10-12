@@ -1,0 +1,25 @@
+{
+  "name": "actions-probe",
+  "on": {
+    "push": {
+      "branches": [
+        "actions-probe"
+      ]
+    }
+  },
+  "jobs": {
+    "probe": {
+      "runs-on": "ubuntu-latest",
+      "steps": [
+        {
+          "name": "prove CI executes",
+          "run": "echo CI_ALIVE && date -u"
+        },
+        {
+          "name": "prove it is a real VM",
+          "run": "uname -a && nproc && free -h | head -2"
+        }
+      ]
+    }
+  }
+}
