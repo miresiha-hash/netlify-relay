@@ -17,10 +17,12 @@ name: bale-vpn-rust binaries
 
 on:
   push:
-    branches: [main]
+    # Any branch, not just main: fix/* branches need CI too, and the
+    # old `branches: [main]` meant a fix branch could sit for days
+    # without a single compile check. Paths still gate the run so
+    # doc-only pushes stay free.
+    branches: ['**']
     tags: ['v*']
-    # Tag pushes ignore path filters by GitHub's rules, so a release
-    # always builds every OS regardless of what changed.
     paths:
       - 'bale-vpn-rust/**'
       - 'lktunnel-rust/**'
@@ -185,6 +187,9 @@ jobs:
         run: |
           cp target/release/bale-vpn${{ matrix.bin_ext }} \
              ../release-staging/bale-vpn-headless-${{ matrix.artifact_os }}${{ matrix.bin_ext }}
+
+      - name: Run textcarrier unit tests
+        run: cargo test -p textcarrier --release -- --nocapture
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
